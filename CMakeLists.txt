@@ -1,14 +1,14 @@
 cmake_minimum_required(VERSION 3.5)
 
 
-project(DistGER)
+project(FeLoG)
 set(CMAKE_BUILD_TYPE "Debug")
 set(CMAKE_EXPORT_COMPILE_COMMANDS on) # generate compile_commands.json
 
 set(DGER_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 option(WITH_TESTS "Build unit test programs" OFF)
 
-include(distger.cmake)
+include(felog.cmake)
 
 find_package(OpenMP REQUIRED)
 if(OPENMP_FOUND)

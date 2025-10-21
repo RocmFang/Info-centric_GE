@@ -69,7 +69,7 @@ mkdir out
 
 ### Run in Single-machine Environment
 ```
-mpirun -np 8 ./bin/huge_walk -g ../dataset/LJ-8.data-r -p ../dataset/LJ-8.part -v 2238731 -w 2238731 --min_L 20 --min_R 2 -o ./out/LJ --make-undirected -emb_output ./out/LJ_emb.txt -size 128 -iter 1 -threads 72 -window 10 -negative 5 -batch-size 21 -min-count 0 -sample 1e-3 -alpha 0.01 -cbow 0 -reuse-neg 0 -debug 2
+mpirun -np 8 ./bin/felog -g ../dataset/LJ-8.data-r -p ../dataset/LJ-8.part -v 2238731 -w 2238731 --min_L 20 --min_R 2 -o ./out/LJ --make-undirected -emb_output ./out/LJ_emb.txt -size 128 -iter 1 -threads 72 -window 10 -negative 5 -batch-size 21 -min-count 0 -sample 1e-3 -alpha 0.01 -cbow 0 -reuse-neg 0 -debug 2
 ```
 
 ### Run in Distributed Environment
@@ -78,7 +78,7 @@ mpirun -np 8 ./bin/huge_walk -g ../dataset/LJ-8.data-r -p ../dataset/LJ-8.part -
 - Invoke the application with MPI 
 
 ```
-mpirun -hostfile ./hosts -np 8 ./bin/huge_walk -g ../dataset/LJ-8.data-r -p ../dataset/LJ-8.part -v 2238731 -w 2238731 --min_L 20 --min_R 2 -o ./out/LJ --make-undirected -emb_output ./out/LJ_emb.txt -size 128 -iter 1 -threads 72 -window 10 -negative 5 -batch-size 21 -min-count 0 -sample 1e-3 -alpha 0.01 -cbow 0 -reuse-neg 0 -debug 2
+mpirun -hostfile ./hosts -np 8 ./bin/felog -g ../dataset/LJ-8.data-r -p ../dataset/LJ-8.part -v 2238731 -w 2238731 --min_L 20 --min_R 2 -o ./out/LJ --make-undirected -emb_output ./out/LJ_emb.txt -size 128 -iter 1 -threads 72 -window 10 -negative 5 -batch-size 21 -min-count 0 -sample 1e-3 -alpha 0.01 -cbow 0 -reuse-neg 0 -debug 2
 ```
 
 **Check the output files in "out" directory**
