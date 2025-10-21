@@ -39,9 +39,11 @@ Then the compiled application executable files are installed at the "bin" direct
 ls ./bin
 ```
 
-# Partitioning
+# Graph Embedding
 
-If we need to run the train data for the downstream tasks, such as Link prediction, the test data also should be processed.
+### Partitioning
+
+If we need to run the train data for the downstream tasks, such as Link prediction, the test data also should be partitioned.
 
 ```
 cd build
@@ -51,7 +53,7 @@ cd build
 
 The partitioned dataset will be saved in the input dataset directory. 
 
-# Graph Embedding
+### Generate binary data
 
 To start the embedding, we fist need to cover the train graph to binary format
 
