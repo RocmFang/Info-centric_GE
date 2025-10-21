@@ -1,3 +1,4 @@
+<meta name="robots" content="noindex">
 
 ## FeLoG
 This codebase gives the reference implementation of FeLoG
