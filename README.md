@@ -55,7 +55,7 @@ The partitioned dataset will be saved in the input dataset directory.
 
 ### Generate binary data
 
-To start the embedding, we fist need to cover the train graph to binary format
+To start the embedding, we need to cover the train graph to binary format
 
 ```
 cd build
