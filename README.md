@@ -41,8 +41,6 @@ ls ./bin
 
 # Graph Embedding
 
-### Partitioning
-
 If we need to run the train data for the downstream tasks, such as Link prediction, the test data also should be partitioned.
 
 ```
@@ -50,10 +48,6 @@ cd build
 
 ./bin/mpgp -i [train_data] -e [test_data] -v [vertex_num] -p [partition_num] -t [float:0, integer:1]
 ```
-
-The partitioned dataset will be saved in the input dataset directory. 
-
-### Generate binary data
 
 To start the embedding, we need to cover the train graph to binary format
 
