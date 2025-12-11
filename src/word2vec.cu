@@ -61,19 +61,9 @@ std::condition_variable cv;
 bool hasResource = false;
 std::atomic<bool> pauseWalk{false};
 extern volatile bool stop_sampling_flag;
-size_t vocab_hash_size = 900000000ULL;  // Default capacity, adjusted dynamically per dataset
-constexpr size_t kVocabHashCap = 900000000ULL;  // Hard cap to avoid excessive allocations
-
-static size_t CalculateVocabHashSize(size_t node_count) {
-  if (node_count == 0) {
-    return std::min<size_t>(kVocabHashCap, static_cast<size_t>(1024));
-  }
-  const double load_factor = 0.7;
-  size_t desired = static_cast<size_t>(std::ceil(node_count / load_factor));
-  if (desired > kVocabHashCap) desired = kVocabHashCap;
-  if (desired < 1024) desired = 1024;
-  return desired;
-}
+#ifndef CXX_UNLIKELY
+#define CXX_UNLIKELY(x) (__builtin_expect(!!(x), 0))
+#endif
 
 namespace {
 struct AddWordToVocabProfile {
@@ -81,8 +71,6 @@ struct AddWordToVocabProfile {
   double alloc_time = 0.0;
   double copy_time = 0.0;
   double realloc_time = 0.0;
-  double hash_time = 0.0;
-  double probe_time = 0.0;
   long long call_count = 0;
 };
 
@@ -95,21 +83,15 @@ inline void ResetAddWordToVocabProfile() {
   ProfileStorage() = AddWordToVocabProfile{};
 }
 
-inline void RecordAddWordToVocabSample(double total, double alloc, double copy, double realloc_t,
-                                        double hash, double probe) {
+inline void RecordAddWordToVocabSample(double total, double alloc, double copy, double realloc_t) {
   auto &profile = ProfileStorage();
   profile.total_time += total;
   profile.alloc_time += alloc;
   profile.copy_time += copy;
   profile.realloc_time += realloc_t;
-  profile.hash_time += hash;
-  profile.probe_time += probe;
   profile.call_count += 1;
 }
 
-inline AddWordToVocabProfile GetAddWordToVocabProfile() {
-  return ProfileStorage();
-}
 }
 
 MPI_Comm MPI_EMB_COMM;
@@ -179,9 +161,8 @@ char train_file[MAX_STRING], output_file[MAX_STRING];
 char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];
 struct vocab_word *vocab;
 int binary = 0, cbow = 1, debug_mode = 2, window = 5, min_count = 5, min_reduce = 1, reuseNeg = 1;
-long long *vocab_hash;
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
-long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
+long long train_words = 0, word_count_actual = 0, iter = 5, classes = 0;
 float alpha = 0.025, starting_alpha, sample = 1e-3;
 float *syn0, *syn1, *syn1neg, *expTable;
 clock_t start;
@@ -712,60 +693,11 @@ void InitUnigramTable() {
   checkCUDAerr(cudaMemcpy(d_table, table, table_size*sizeof(int), cudaMemcpyHostToDevice));
 }
 
-// Reads a single word from a file, assuming space + tab + EOL to be word boundaries
-void ReadWord(char *word, FILE *fin) {
-  int a = 0, ch;
-  while (!feof(fin)) {
-    ch = fgetc(fin);
-    if (ch == 13) continue;
-    if ((ch == ' ') || (ch == '\t') || (ch == '\n')) {
-      if (a > 0) { if (ch == '\n') ungetc(ch, fin);
-        break;
-      }
-      if (ch == '\n') {
-        strcpy(word, (char *)"</s>");
-        return;
-      } else continue;
-    }
-    word[a] = ch;
-    a++;
-    if (a >= MAX_STRING - 1) a--;   // Truncate too long words
-  }
-  word[a] = 0;
-}
-
-// Returns hash value of a word
-int GetWordHash(char *word) {
-  unsigned long long a, hash = 0;
-  for (a = 0; a < strlen(word); a++) hash = hash * 257 + word[a];
-  hash = hash % vocab_hash_size;
-  return hash;
-}
-
-// Returns position of a word in the vocabulary; if the word is not found, returns -1
-int SearchVocab(char *word) {
-  unsigned int hash = GetWordHash(word);
-  while (1) {
-    if (vocab_hash[hash] == -1) return -1;
-    if (!strcmp(word, vocab[vocab_hash[hash]].word)) return vocab_hash[hash];
-    hash = (hash + 1) % vocab_hash_size;
-  }
-  //  return -1;
-}
-
-// Reads a word and returns its index in the vocabulary
-int ReadWordIndex(FILE *fin) {
-  char word[MAX_STRING];
-  ReadWord(word, fin);
-  if (feof(fin)) return -1;
-  return SearchVocab(word);
-}
-
 // Adds a word to the vocabulary
 int AddWordToVocab(char *word) {
   Timer total_timer;
   Timer step_timer;
-  unsigned int hash, length = strlen(word) + 1;
+  unsigned int length = strlen(word) + 1;
   if (length > MAX_STRING) length = MAX_STRING;
 
   step_timer.restart();
@@ -786,19 +718,10 @@ int AddWordToVocab(char *word) {
   }
   double realloc_time = step_timer.duration();
 
-  step_timer.restart();
-  hash = GetWordHash(word);
-  double hash_time = step_timer.duration();
-
-  step_timer.restart();
-  while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
-  double probe_time = step_timer.duration();
-
   int index = vocab_size - 1;
-  vocab_hash[hash] = index;
 
   double total_time = total_timer.duration();
-  RecordAddWordToVocabSample(total_time, alloc_time, copy_time, realloc_time, hash_time, probe_time);
+  RecordAddWordToVocabSample(total_time, alloc_time, copy_time, realloc_time);
   return index;
 }
 
@@ -810,10 +733,8 @@ int VocabCompare(const void *a, const void *b) {
 // Sorts the vocabulary by frequency using word counts
 void SortVocab() {
   size_t size;
-  unsigned long long hash;
   // Sort the vocabulary and keep </s> at the first position
   qsort(&vocab[0], vocab_size, sizeof(struct vocab_word), VocabCompare);
-  for (size_t hash_idx = 0; hash_idx < vocab_hash_size; ++hash_idx) vocab_hash[hash_idx] = -1;
   size = vocab_size;
   train_words = 0;
   for (size_t a = 0; a < size; a++) {
@@ -822,10 +743,6 @@ void SortVocab() {
       vocab_size--;
       free(vocab[a].word);
     } else {
-      // Hash will be re-computed, as after the sorting it is not actual
-      hash=GetWordHash(vocab[a].word);
-      while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
-      vocab_hash[hash] = a;
       train_words += vocab[a].cn;
     }
   }
@@ -835,27 +752,6 @@ void SortVocab() {
     vocab[a].code = (char *)calloc(MAX_CODE_LENGTH, sizeof(char));
     vocab[a].point = (int *)calloc(MAX_CODE_LENGTH, sizeof(int));
   }
-}
-
-// Reduces the vocabulary by removing infrequent tokens
-void ReduceVocab() {
-  int a, b = 0;
-  unsigned int hash;
-  for (a = 0; a < vocab_size; a++) if (vocab[a].cn > min_reduce) {
-    vocab[b].cn = vocab[a].cn;
-    vocab[b].word = vocab[a].word;
-    b++;
-  } else free(vocab[a].word);
-  vocab_size = b;
-  for (size_t hash_idx = 0; hash_idx < vocab_hash_size; ++hash_idx) vocab_hash[hash_idx] = -1;
-  for (a = 0; a < vocab_size; a++) {
-    // Hash will be re-computed, as it is not actual
-    hash = GetWordHash(vocab[a].word);
-    while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
-    vocab_hash[hash] = a;
-  }
-  fflush(stdout);
-  min_reduce++;
 }
 
 // Create binary Huffman tree using the word counts
@@ -926,42 +822,6 @@ void CreateBinaryTree() {
   free(parent_node);
 }
 
-void LearnVocabFromTrainFile() {
-  char word[MAX_STRING];
-  FILE *fin;
-  long long a, i;
-  for (size_t hash_idx = 0; hash_idx < vocab_hash_size; ++hash_idx) vocab_hash[hash_idx] = -1;
-  fin = fopen(train_file, "rb");
-  if (fin == NULL) {
-    printf("ERROR: training data file not found!\n");
-    exit(1);
-  }
-  vocab_size = 0;
-  AddWordToVocab((char *)"</s>");
-  while (1) {
-    ReadWord(word, fin);
-    if (feof(fin)) break;
-    train_words++;
-    if ((debug_mode > 1) && (train_words % 100000 == 0)) {
-      printf("%lldK%c", train_words / 1000, 13);
-      fflush(stdout);
-    }
-    i = SearchVocab(word);
-    if (i == -1) {
-      a = AddWordToVocab(word);
-      vocab[a].cn = 1;
-    } else vocab[i].cn++;
-  if (vocab_size > static_cast<long long>(static_cast<double>(vocab_hash_size) * 0.7)) ReduceVocab();
-  }
-  SortVocab();
-  if (debug_mode > 0) {
-    // printf("Vocab size: %lld\n", vocab_size);
-    // printf("Words in train file: %lld\n", train_words); 
-  }
-  file_size = ftell(fin);
-  fclose(fin);
-}
-
 void SaveVocab() {
   long long i;
   FILE *fo = fopen(save_vocab_file, "wb");
@@ -978,8 +838,6 @@ void ReadVocabFromDegree(vector<vertex_id_t>& degrees){
 
   ResetAddWordToVocabProfile();
 
-  for (size_t hash_idx = 0; hash_idx < vocab_hash_size; ++hash_idx) vocab_hash[hash_idx] = -1;
-
   vocab_size = 0;
   for (vertex_id_t v = 0; v < v_num; v++)
   {
@@ -987,8 +845,6 @@ void ReadVocabFromDegree(vector<vertex_id_t>& degrees){
     int idx = AddWordToVocab(word);
     vocab[idx].cn = degrees[v];
   }
-
-  auto profile = GetAddWordToVocabProfile();
 
   SortVocab();
 
@@ -1003,40 +859,6 @@ void ReadVocabFromDegree(vector<vertex_id_t>& degrees){
     vertex_id_t nid = (vertex_id_t)strtoul(vocab[vi].word, &endptr, 10);
     id2offset[nid] = vi;
   };
-}
-
-void ReadVocab() {
-  int a;
-  long long i = 0;
-  char c;
-  char word[MAX_STRING];
-  FILE *fin = fopen(read_vocab_file, "rb");
-  if (fin == NULL) {
-    printf("Vocabulary file not found\n");
-    exit(1);
-  }
-  for (size_t hash_idx = 0; hash_idx < vocab_hash_size; ++hash_idx) vocab_hash[hash_idx] = -1;
-  vocab_size = 0;
-  while (1) {
-    ReadWord(word, fin);
-    if (feof(fin)) break;
-    a = AddWordToVocab(word);
-    fscanf(fin, "%lld%c", &vocab[a].cn, &c);
-    i++;
-  }
-  SortVocab();
-  if (debug_mode > 0) {
-    // printf("Vocab size: %lld\n", vocab_size);
-    // printf("Words in train file: %lld\n", train_words);
-  }
-  fin = fopen(train_file, "rb");
-  if (fin == NULL) {
-    printf("ERROR: training data file not found!\n");
-    exit(1);
-  }
-  fseek(fin, 0, SEEK_END);
-  file_size = ftell(fin);
-  fclose(fin);
 }
 
 void InitNet() {
@@ -1308,176 +1130,6 @@ void sync_embedding_func()
 }
 
 LR *lr_scheduler;
-void TrainModelThreadMemory(const corpus_t& corpus_data);  // Declaration for memory-based training
-void TrainModelThread(string data_path)
-{
-  printf("[ p%d ]=====================Train file %s============\n",my_rank,data_path.c_str());
-  long long word, word_count = 0, last_word_count = 0;
-  long long local_iter = iter;
-
-  // use in kernel
-  int total_sent_len, reduSize= 32;
-  int *sen, *sentence_length, *d_sen, *d_sent_len;
-  sen = (int *)malloc(MAX_SENTENCE * 100 * sizeof(int));
-  sentence_length = (int *)malloc((MAX_SENTENCE + 1) * sizeof(int));
-
-  checkCUDAerr(cudaMalloc((void **)&d_sen, MAX_SENTENCE * 100 * sizeof(int)));
-  checkCUDAerr(cudaMalloc((void **)&d_sent_len, (MAX_SENTENCE + 1) * sizeof(int)));
-  int *negSample = (int *)malloc(MAX_SENTENCE * negative * sizeof(int));
-  int *d_negSample;
-  checkCUDAerr(cudaMalloc(&d_negSample, MAX_SENTENCE * negative * sizeof(int)));
-  std::vector<uint16_t> subsample_thresholds = BuildSubsamplingThresholds(sample, train_words);
-
-  if (!subsample_thresholds.empty()) {
-    // printf("[ %d ] Subsampling thresholds built in %.6f seconds\n", my_rank, subsampling_precompute_time);
-  }
-  FastRandomState fast_rng(InitSeedForRank(my_rank, 0x1ULL));
-
-#ifndef CXX_UNLIKELY
-#define CXX_UNLIKELY(x) (__builtin_expect(!!(x), 0))
-#endif
-
-
-  while (reduSize < layer1_size) {
-    reduSize *= 2;
-  }
-
-  clock_t now;
-  strcpy(train_file,data_path.c_str());
-  
-  Timer file_read_timer;
-  printf("[ %d ] Starting file read: %s\n", my_rank, train_file);
-  
-  FILE *fi = fopen(train_file, "r");
-  if(fi == nullptr) {
-    printf("open [%s] fail\n",data_path.c_str());
-    throw std::runtime_error("Data file open fail");
-  }
-  fseek(fi, 0, SEEK_SET);
-
-  while (1) {
-    unique_lock<mutex> lock(sync_mtx);
-    sync_cv.wait(lock,[]{return !trainBlocked;});
-                                                              
-    if (word_count - last_word_count > 10000) {
-      word_count_actual += word_count - last_word_count;
-      last_word_count = word_count;
-      if ((debug_mode > 1)) {
-        now = clock();
-        printf("%cAlpha: %f  Words/sec: %.2fk  ", 13, alpha,
-            // word_count_actual / (float)(iter * train_words + 1) * 100,
-            word_count_actual / ((float)(now - start + 1) / (float)CLOCKS_PER_SEC * 1000));
-        fflush(stdout);
-      }
-      // alpha = starting_alpha * (1 - word_count / (float)(iter * train_words + 1));
-      // if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001;
-    }
-    total_sent_len = 0;
-    sentence_length[0] = 0;
-    int cnt_sentence = 0;
-
-    while (cnt_sentence < MAX_SENTENCE) {                           // Read words
-      int temp_sent_len = 0;
-      char tSentence[MAX_SENTENCE_LENGTH];
-      char *wordTok;
-      if (feof(fi)) break;
-      fgets(tSentence, MAX_SENTENCE_LENGTH + 1, fi);
-      wordTok = strtok(tSentence, " \n\r\t");
-      while(1) {
-        if (wordTok == NULL) {
-          word_count++;
-          break;
-        }
-        word = SearchVocab(wordTok);
-        wordTok = strtok(NULL, " \n\r\t");
-        if (word == -1) continue;
-        word_count++;
-        if (word == 0) {
-          word_count++;
-          break;
-        }
-        if (!subsample_thresholds.empty()) {
-          const uint16_t keep_threshold = subsample_thresholds[word];
-          if (CXX_UNLIKELY(keep_threshold < kFullKeepThreshold)) {
-            uint16_t random16 = fast_rng.Next16();
-            if (random16 > keep_threshold) {
-              continue;
-            }
-          }
-        }
-        sen[total_sent_len] = word;
-        total_sent_len++;
-        temp_sent_len++;
-        if (temp_sent_len >= MAX_SENTENCE_LENGTH) break;
-      }
-      if (word == 0) {
-        word_count++;
-        break;
-      }
-      if (temp_sent_len >= MAX_SENTENCE_LENGTH) break;
-
-      cnt_sentence++;
-      sentence_length[cnt_sentence] = total_sent_len;
-      if (total_sent_len >= (MAX_SENTENCE - 1) * 20) break;
-    }
-
-    if (feof(fi) || (word_count > train_words)) {                   // Initialize for iteration
-      word_count_actual += word_count - last_word_count;
-      local_iter--;
-      if (local_iter == 0) break;
-      word_count = 0;
-      last_word_count = 0;
-      for (int i=0; i<MAX_SENTENCE+1; i++)
-        sentence_length[i] = 0;
-      total_sent_len = 0;
-      fseek(fi, 0, SEEK_SET);
-      continue;
-    }
-
-    // Negative sampling in advance. A sentence shares negative samples
-    for (int i = 0; i < cnt_sentence * negative; i++) {
-      uint32_t randd = fast_rng.Next32();
-      int tempSample = table[randd % table_size];
-      if (tempSample == 0) {
-        negSample[i] = static_cast<int>(randd % (vocab_size - 1)) + 1;
-      } else {
-        negSample[i] = tempSample;
-      }
-    }
-    checkCUDAerr(cudaMemcpy(d_negSample, negSample, cnt_sentence * negative * sizeof(int), cudaMemcpyHostToDevice));
-    cudaError_t cet = cudaMemcpy(d_sen, sen, total_sent_len * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaSuccess != cet)
-    {
-      printf("%s %d : %s\n", __FILE__, __LINE__, cudaGetErrorString(cet));
-      printf("copy size: %zu \n",total_sent_len*sizeof(int));
-      exit(0);
-    }
-    checkCUDAerr(cudaMemcpy(d_sent_len, sentence_length, (cnt_sentence + 1) * sizeof(int), cudaMemcpyHostToDevice));
-
-    if (cbow)
-      cbowKernel(d_sen, d_sent_len, alpha, cnt_sentence, reduSize);
-    else
-    {
-      // printf("[ %d ] sgKernel Invoke\n",my_rank);
-      sgKernel(d_sen, d_sent_len, d_negSample, alpha, cnt_sentence, reduSize);
-    }
-  }
-  cudaDeviceSynchronize();
-  checkCUDAerr(cudaMemcpy(syn0, d_syn0, vocab_size * layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
-
-  
-  fclose(fi);
-
-  // free memory
-  free(sen);
-  free(sentence_length);
-  free(negSample);
-  cudaFree(d_sen);
-  cudaFree(d_sent_len);
-  cudaFree(d_negSample);
-}
-
-// New function to train directly with memory corpus data (no disk I/O)
 void TrainModelThreadMemory(const corpus_t& corpus_data)
 {
   // printf("[ p%d ]=====================Train memory corpus (size: %zu)============\n", my_rank, corpus_data.size());
@@ -2287,8 +1939,7 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
   int batch_size = config.batch_size;
   
 
-  // if (read_vocab_file[0] != 0) ReadVocab(); else LearnVocabFromTrainFile();
-  // if (save_vocab_file[0] != 0) SaveVocab();
+  // Vocabulary now comes directly from in-memory degrees; legacy file-based loaders are removed.
   if (output_file[0] == 0) printf("[ Warning ] output file missing\n");
   if (output_file[0] == 0) return;
   
@@ -2560,7 +2211,6 @@ int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,S
   g_v_degree.assign(degrees.begin(), degrees.end());
 
   const size_t node_count = g_v_degree.size();
-  vocab_hash_size = CalculateVocabHashSize(node_count);
   const size_t desired_vocab_capacity = node_count + 1000ULL;
   if (static_cast<size_t>(vocab_max_size) < desired_vocab_capacity) {
     vocab_max_size = static_cast<long long>(desired_vocab_capacity);
@@ -2634,9 +2284,11 @@ int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,S
   if ((i = ArgPos((char *)"-min-count", argc, argv)) > 0) min_count = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-classes", argc, argv)) > 0) classes = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-reuse-neg", argc, argv)) > 0) reuseNeg = atoi(argv[i + 1]);
+  if (train_file[0] != 0) {
+    printf("[ Warning ] '-train' option is ignored; training data comes from in-memory corpus.\n");
+  }
 
   vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
-  vocab_hash = (long long *)calloc(vocab_hash_size, sizeof(long long));
   expTable = (float *)malloc((EXP_TABLE_SIZE + 1) * sizeof(float));
 
   for (i = 0; i < EXP_TABLE_SIZE; i++) {
@@ -2658,7 +2310,6 @@ int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,S
   free(syn1);
   free(syn1neg);
   free(vocab);
-  free(vocab_hash);
   free(expTable);
   if (vocab_codelen != nullptr)
   {
