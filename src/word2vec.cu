@@ -25,10 +25,13 @@
 #include "edge_container.hpp"
 #include "lr_scheduler.hpp"
 #include "util.hpp"
+#include "compress.hpp"
 #include <algorithm>
 #include <mpi.h>
 
 extern int my_rank;
+int compress_size = 4 + 1;
+int avg_length = 20;
 
 using std::vector;
 using std::string;
@@ -55,6 +58,144 @@ using std::endl;
   }\
 }
 
+class TimeCollector {
+public:
+	Timer timer_for_total;
+  Timer timer_for_train_model;
+  Timer timer_for_part;
+	double total_time = 0.0;  // 从TrainModel开始到结束的总时间
+  double init_time = 0.0; // 训练初始化时间
+  double train_thread_time = 0.0; // TrainModelThreadMemory函数总时间
+	double compress_time = 0.0; // 压缩时间
+	double uncompress_time_GPU = 0.0; //GPU解压缩时间
+  double uncompress_time_CPU = 0.0; //CPU解压缩时间
+  double prepare_data = 0.0; // 训练数据准备时间
+	double transfer_time = 0.0; // CPU->GPU传输时间（训练数据的传输）
+  double transfer_back_time = 0.0; // GPU->CPU传输时间（嵌入向量的传输）
+	double train_time = 0.0;  // 训练时间
+	double eva_time = 0.0; // 评估时间
+  int count = 0; // 计数器，用于计算平均时间
+
+	void reset() {
+		total_time = 0.0;
+    init_time = 0.0;
+    train_thread_time = 0.0;
+		compress_time = 0.0;
+		uncompress_time_GPU = 0.0;
+    uncompress_time_CPU = 0.0;
+    prepare_data = 0.0;
+		transfer_time = 0.0;
+    transfer_back_time = 0.0;
+		train_time = 0.0;
+		eva_time = 0.0;
+    count = 0;
+	}
+
+	void print() {
+		printf("Total time: %.3f s\n", total_time);
+    printf("  Init time: %.3f s\n", init_time);
+    printf("  Train thread time: %.3f s\n", train_thread_time);
+		printf("  Compress time: %.3f s\n", compress_time);
+		printf("  Uncompress-GPU time: %.3f s\n", uncompress_time_GPU);
+    printf("  Uncompress-CPU time: %.3f s\n", uncompress_time_CPU);
+    printf("  Prepare data time: %.3f s\n", prepare_data);
+		printf("  Transfer CPU->GPU time: %.3f s\n", transfer_time);
+    printf("  Transfer GPU->CPU time: %.3f s\n", transfer_back_time);
+		printf("  Train time: %.3f s\n", train_time);
+		printf("  Eva time: %.3f s\n", eva_time);
+    printf("Count: %d\n", count);
+	}
+
+  void save(const string &filename) {
+    FILE *f = fopen(filename.c_str(), "w");
+    if (f == nullptr) {
+      throw std::runtime_error("Failed to open time collector file for writing: " + filename);
+    }
+    fprintf(f, "%lf\n", total_time);
+    fprintf(f, "%lf\n", init_time);
+    fprintf(f, "%lf\n", train_thread_time);
+    fprintf(f, "%lf\n", compress_time);
+    fprintf(f, "%lf\n", uncompress_time_GPU);
+    fprintf(f, "%lf\n", uncompress_time_CPU);
+    fprintf(f, "%lf\n", prepare_data);
+    fprintf(f, "%lf\n", transfer_time);
+    fprintf(f, "%lf\n", transfer_back_time);
+    fprintf(f, "%lf\n", train_time);
+    fprintf(f, "%lf\n", eva_time);
+    fprintf(f, "%d\n", count);
+    fclose(f);
+  }
+
+  void load(const string &filename) {
+    FILE *f = fopen(filename.c_str(), "r");
+    if (f == nullptr) {
+      // throw std::runtime_error("Failed to open time collector file for reading: " + filename);
+      this->reset();
+      return;
+    }
+    fscanf(f, "%lf\n", &total_time);
+    fscanf(f, "%lf\n", &init_time);
+    fscanf(f, "%lf\n", &train_thread_time);
+    fscanf(f, "%lf\n", &compress_time);
+    fscanf(f, "%lf\n", &uncompress_time_GPU);
+    fscanf(f, "%lf\n", &uncompress_time_CPU);
+    fscanf(f, "%lf\n", &prepare_data);
+    fscanf(f, "%lf\n", &transfer_time);
+    fscanf(f, "%lf\n", &transfer_back_time);
+    fscanf(f, "%lf\n", &train_time);
+    fscanf(f, "%lf\n", &eva_time);
+    fscanf(f, "%d\n", &count);
+    fclose(f);
+  }
+};
+
+//===================GPU Uncompress===================
+//[TODO]并行前缀和、bitmap移入共享内存
+__global__ void uncompressKernel_A(int *d_misc_data, int *d_misc_data_len, char *d_bitmap, int *d_bitmap_len, int *d_sen, int *d_sent_len, int bitmap_num) {
+  int sen_id = blockIdx.x;
+  int tid = threadIdx.x;
+  int sen_start = d_sent_len[sen_id];
+  int sen_end = d_sent_len[sen_id + 1];
+
+  int misc_start = d_misc_data_len[sen_id];
+  int misc_end = d_misc_data_len[sen_id + 1];
+
+  __shared__ int prefixSum_bitmap[MAX_SENTENCE_LENGTH];
+	if(tid == 0){
+		int misc_bitmap = (sen_id + 1) * bitmap_num - 1;
+		int sum = 0;
+		for(size_t i = 0;i < sen_end - sen_start;i++){
+			bool is_core = d_bitmap[d_bitmap_len[misc_bitmap] + i / 8] & (1 << (i % 8));
+			if(is_core){
+				prefixSum_bitmap[i] = sum++;
+			} else prefixSum_bitmap[i] = 0;
+		}
+	}
+	__syncthreads();
+
+	for(size_t i = tid;i < (sen_end - sen_start);i += blockDim.x){
+		for(int j = 0;j < bitmap_num;j++){
+      if((d_bitmap_len[sen_id * bitmap_num + j] + i / 8) >=  d_bitmap_len[sen_id * bitmap_num + j + 1]) continue;
+			bool is_core = d_bitmap[d_bitmap_len[sen_id * bitmap_num + j] + i / 8] & (1 << (i % 8));
+			if(!is_core) continue;
+
+			int index_in_misc = misc_start + ((j != bitmap_num - 1)?(j):(bitmap_num + prefixSum_bitmap[i] - 1));
+			d_sen[sen_start + i] = d_misc_data[index_in_misc];
+      break;
+		}
+	}
+}
+
+void CorpusCompressor::uncompressCorpusGPU(int *d_misc_data, int *d_misc_data_len, char *d_bitmap, int *d_bitmap_len, int *d_sen, int *d_sent_len, int cnt_sentence){
+	int bDim = 128;
+  int gDim = cnt_sentence;
+
+	uncompressKernel_A<<<gDim, bDim>>>(d_misc_data, d_misc_data_len, d_bitmap, d_bitmap_len, d_sen, d_sent_len, compress_size);
+	cudaDeviceSynchronize();
+}
+
+TimeCollector time_collector; // 时间统计器
+CorpusCompressor compressor;  // 语料压缩器
 vector<int> vertex_walker_stop_flag;
 std::mutex mtx;
 std::condition_variable cv;
@@ -96,6 +237,7 @@ inline void RecordAddWordToVocabSample(double total, double alloc, double copy, 
 
 MPI_Comm MPI_EMB_COMM;
 MPI_Comm MPI_EVA_COMM;
+MPI_Comm MPI_SYNC_COMM;
 int num_procs = 1;
 int my_rank = 0;
 
@@ -1012,7 +1154,7 @@ void all_sync(){
     checkCUDAerr(cudaMemcpy(syn0, d_syn0, (size_t)vocab_size * layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
     checkCUDAerr(cudaDeviceSynchronize());
     
-    MPI_Allreduce(MPI_IN_PLACE, syn0, (size_t)vocab_size* layer1_size , MPI_FLOAT, MPI_SUM, MPI_EMB_COMM);
+    MPI_Allreduce(MPI_IN_PLACE, syn0, (size_t)vocab_size* layer1_size , MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
     
     for(size_t i = 0; i < (size_t) vocab_size * layer1_size;i++){
         syn0[i] /= num_procs;
@@ -1090,12 +1232,12 @@ void sync_embedding_func()
       sync_node_num = sync_vocab_id_array.size();
     }
     // broadcast sync id amount
-    MPI_Bcast(&sync_node_num,1,get_mpi_data_type<int>(),0,MPI_EMB_COMM);
+    MPI_Bcast(&sync_node_num,1,get_mpi_data_type<int>(),0,MPI_SYNC_COMM);
     if(my_rank != 0)
     {
       sync_vocab_id_array.resize(sync_node_num);
     }
-    MPI_Bcast(sync_vocab_id_array.data(), sync_node_num, get_mpi_data_type<int>(), 0, MPI_EMB_COMM);
+    MPI_Bcast(sync_vocab_id_array.data(), sync_node_num, get_mpi_data_type<int>(), 0, MPI_SYNC_COMM);
     // printf("[ %d ] sync_vocab_id_array size: %ld\n",my_rank,sync_vocab_id_array.size());
     // embedding buffer
     float *h_sync_emb_buffer = (float*)malloc(sync_node_num * layer1_size *sizeof(float));
@@ -1110,7 +1252,7 @@ void sync_embedding_func()
     }
     checkCUDAerr(cudaDeviceSynchronize());
     // synchronize
-    MPI_Allreduce(MPI_IN_PLACE, h_sync_emb_buffer,sync_node_num * layer1_size , MPI_FLOAT, MPI_SUM, MPI_EMB_COMM);
+    MPI_Allreduce(MPI_IN_PLACE, h_sync_emb_buffer,sync_node_num * layer1_size , MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
     for(vertex_id_t i = 0; i < sync_node_num * layer1_size; i++){
       h_sync_emb_buffer[i] /= num_procs;
     }
@@ -1132,21 +1274,19 @@ void sync_embedding_func()
 LR *lr_scheduler;
 void TrainModelThreadMemory(const corpus_t& corpus_data)
 {
-  // printf("[ p%d ]=====================Train memory corpus (size: %zu)============\n", my_rank, corpus_data.size());
+  printf("[ p%d ]=====================Train memory corpus (size: %zu)============\n", my_rank, corpus_data.size());
   long long word, word_count = 0, last_word_count = 0;
   long long local_iter = iter;
 
   // use in kernel
-
   int total_sent_len, reduSize = 32;
-  int *sen, *sentence_length, *d_sen, *d_sent_len;
+  int *sen, *sentence_length, *d_sen, *d_sent_len, *negSample, *d_negSample;
   sen = (int *)malloc(MAX_SENTENCE * 100 * sizeof(int));
   sentence_length = (int *)malloc((MAX_SENTENCE + 1) * sizeof(int));
+  negSample = (int *)malloc(MAX_SENTENCE * negative * sizeof(int));
 
   checkCUDAerr(cudaMalloc((void **)&d_sen, MAX_SENTENCE * 100 * sizeof(int)));
   checkCUDAerr(cudaMalloc((void **)&d_sent_len, (MAX_SENTENCE + 1) * sizeof(int)));
-  int *negSample = (int *)malloc(MAX_SENTENCE * negative * sizeof(int));
-  int *d_negSample;
   checkCUDAerr(cudaMalloc(&d_negSample, MAX_SENTENCE * negative * sizeof(int)));
 
   std::vector<uint16_t> subsample_thresholds = BuildSubsamplingThresholds(sample, train_words);
@@ -1199,33 +1339,24 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
           continue;
         }
         word_count++;
-        if (word == 0) {
-          word_count++;  // Match file mode behavior
-          break;  // End of sentence
-        }
 
-        if (!subsample_thresholds.empty()) {
-          const uint16_t keep_threshold = subsample_thresholds[word];
-          if (CXX_UNLIKELY(keep_threshold < kFullKeepThreshold)) {
+        // if (!subsample_thresholds.empty()) {
+        //   const uint16_t keep_threshold = subsample_thresholds[word];
+        //   if (CXX_UNLIKELY(keep_threshold < kFullKeepThreshold)) {
 
-            uint16_t random16 = fast_rng.Next16();
+        //     uint16_t random16 = fast_rng.Next16();
 
 
-            bool discard_token = random16 > keep_threshold;
+        //     bool discard_token = random16 > keep_threshold;
 
-            if (discard_token) continue;
-          }
-        }
+        //     if (discard_token) continue;
+        //   }
+        // }
 
         sen[total_sent_len] = word;
         total_sent_len++;
         temp_sent_len++;
         if (temp_sent_len >= MAX_SENTENCE_LENGTH) break;
-      }
-
-      // Check if sentence ended with word 0, matching file mode behavior
-      if (word == 0) {
-        word_count++;
       }
 
       cnt_sentence++;
@@ -1270,6 +1401,168 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
   cudaFree(d_sen);
   cudaFree(d_sent_len);
   cudaFree(d_negSample);
+}
+void TrainModelThreadMemory_CompressCorpus(const corpus_t& corpus_data)
+{
+  printf("[ p%d ]=====================Train memory corpus (size: %zu)=====================\n", my_rank, corpus_data.size());
+  long long word, word_count = 0, last_word_count = 0;
+  long long local_iter = iter;
+
+  // 数据空间分配
+  int total_sent_len, total_len, reduSize = 32;
+  int *misc_data, *misc_data_len, *bitmap_len, *sen, *sentence_length, *negSample; // CPU使用
+  char *bitmap;
+  int *d_misc_data, *d_misc_data_len, *d_bitmap_len, *d_sen, *d_sent_len, *d_negSample;  // GPU使用
+  char *d_bitmap;
+
+  misc_data = (int *)malloc(MAX_SENTENCE * avg_length * sizeof(int));  // avg_length = 50  2.86G  OK
+  misc_data_len = (int *)malloc((MAX_SENTENCE + 1) * sizeof(int));  // 0.06G  OK
+  bitmap = (char *)malloc(compress_size * MAX_SENTENCE * ((avg_length - 1) / 8 + 1 + 1) * sizeof(char));  // 0.86G
+  bitmap_len = (int *)malloc((compress_size * MAX_SENTENCE + 1) * sizeof(int)); // 0.17G  OK
+  // sen = (int *)malloc(MAX_SENTENCE * avg_length * sizeof(int));  // [debug]check使用 5.72G
+  sentence_length = (int *)malloc((MAX_SENTENCE + 1) * sizeof(int));  // 0.06G  OK
+  negSample = (int *)malloc(MAX_SENTENCE * negative * sizeof(int));
+
+  checkCUDAerr(cudaMalloc((void **)&d_misc_data, MAX_SENTENCE * avg_length * sizeof(int)));
+  checkCUDAerr(cudaMalloc((void **)&d_misc_data_len, (MAX_SENTENCE + 1) * sizeof(int)));
+  checkCUDAerr(cudaMalloc((void **)&d_bitmap, compress_size * MAX_SENTENCE * ((avg_length - 1) / 8 + 1 + 1) * sizeof(char)));
+  checkCUDAerr(cudaMalloc((void **)&d_bitmap_len, (compress_size * MAX_SENTENCE + 1) * sizeof(int)));
+  checkCUDAerr(cudaMalloc((void **)&d_sen, MAX_SENTENCE * avg_length * sizeof(int)));
+  checkCUDAerr(cudaMalloc((void **)&d_sent_len, (MAX_SENTENCE + 1) * sizeof(int)));
+  checkCUDAerr(cudaMalloc(&d_negSample, MAX_SENTENCE * negative * sizeof(int)));
+
+  std::vector<uint16_t> subsample_thresholds = BuildSubsamplingThresholds(sample, train_words);
+  if (!subsample_thresholds.empty()) {
+    // printf("[ %d ] Subsampling thresholds built in %.6f seconds\n", my_rank, subsampling_precompute_time);
+  }
+  FastRandomState fast_rng(InitSeedForRank(my_rank, 0x2ULL));
+
+  while (reduSize < layer1_size) reduSize *= 2;
+
+  clock_t now;
+  start = clock();
+
+  // 压缩语料
+  time_collector.timer_for_part.restart();
+  compress_t compress_corpus;
+  compressor.compressCorpus(corpus_data, compress_corpus);
+  time_collector.compress_time += time_collector.timer_for_part.duration();
+
+  // [debug]压缩方法检查
+  corpus_t uncompressCPU;
+  time_collector.timer_for_part.restart();
+  compressor.uncompressCorpus(uncompressCPU, compress_corpus);
+  time_collector.uncompress_time_CPU += time_collector.timer_for_part.duration();
+  // assert( compressor.check(corpus_data, uncompressCPU) );
+
+  // 训练过程。批量训练，每次最多训练 MAX_SENTENCE 个句子
+  size_t corpus_index = 0;
+  while (corpus_index < compress_corpus.size()) {
+    // Only wait for synchronization when running across multiple processes
+    // OPTIMIZATION: No need to wait for sync during training
+    if (num_procs > 1) {
+      unique_lock<mutex> lock(sync_mtx);
+      sync_cv.wait(lock,[]{return !trainBlocked;});
+    }                                                            
+    
+    time_collector.timer_for_part.restart();
+    int ori = corpus_index;
+
+    total_sent_len = 0;
+    total_len = 0;
+    sentence_length[0] = 0;
+    misc_data_len[0] = 0;
+    bitmap_len[0] = 0;
+    int cnt_sentence = 0;
+    while (cnt_sentence < MAX_SENTENCE && corpus_index < compress_corpus.size()) {
+      const auto& sequence = compress_corpus[corpus_index];
+      int temp_sent_len = 0;
+      for (auto vertex_id : sequence.misc_data) {
+        word = id2offset[vertex_id];  // Convert vertex ID to vocab index
+
+        misc_data[total_sent_len] = word;
+        total_sent_len++;
+        temp_sent_len++;
+        if(temp_sent_len >= MAX_SENTENCE_LENGTH) {
+          printf("[ p%d ] Warning: one sentence too long, truncate it.\n", my_rank);
+          break;
+        }
+      }
+
+      for(int i = 0;i < compress_size;i++) {
+        const auto& bp = sequence.coreMap[i];
+        memcpy(bitmap + bitmap_len[cnt_sentence * compress_size + i], bp.data.data(), bp.data.size());
+        bitmap_len[cnt_sentence * compress_size + i + 1] = bitmap_len[cnt_sentence * compress_size + i] + bp.data.size();
+      }
+
+      cnt_sentence++;
+      total_len += sequence.original_size;
+      misc_data_len[cnt_sentence] = total_sent_len;
+      sentence_length[cnt_sentence] = total_len;
+      corpus_index++;
+      if(total_sent_len >= (MAX_SENTENCE - 1) * 20) {
+        printf("[ p%d ] Warning: all sentence too long, truncate it.\n", my_rank);
+        break;
+      }
+      if(total_len >= (MAX_SENTENCE - 1) * 50) {
+        printf("[ p%d ] Warning: all sentence original length too long, truncate it.\n", my_rank);
+        break;
+      }
+    }
+
+    if (cnt_sentence == 0) break;
+
+    // 生成负样本
+    for (int i = 0; i < cnt_sentence * negative; i++) {
+      uint32_t randd = fast_rng.Next32();
+      int tempSample = table[randd % table_size];
+      if (tempSample == 0) {
+        negSample[i] = static_cast<int>(randd % (vocab_size - 1)) + 1;
+      } else {
+        negSample[i] = tempSample;
+      }
+    }
+    time_collector.prepare_data += time_collector.timer_for_part.duration();
+    // CPU将训练数据传到GPU
+    time_collector.timer_for_part.restart();
+    checkCUDAerr(cudaMemcpy(d_misc_data, misc_data, total_sent_len * sizeof(int), cudaMemcpyHostToDevice));
+    checkCUDAerr(cudaMemcpy(d_misc_data_len, misc_data_len, (cnt_sentence + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    checkCUDAerr(cudaMemcpy(d_bitmap, bitmap, bitmap_len[compress_size * cnt_sentence] * sizeof(char), cudaMemcpyHostToDevice));
+    checkCUDAerr(cudaMemcpy(d_bitmap_len, bitmap_len, (compress_size * cnt_sentence + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    checkCUDAerr(cudaMemcpy(d_sent_len, sentence_length, (cnt_sentence + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    checkCUDAerr(cudaMemcpy(d_negSample, negSample, cnt_sentence * negative * sizeof(int), cudaMemcpyHostToDevice));
+    time_collector.transfer_time += time_collector.timer_for_part.duration();
+
+    // 训练数据解压缩
+    time_collector.timer_for_part.restart();
+    compressor.uncompressCorpusGPU(d_misc_data, d_misc_data_len, d_bitmap, d_bitmap_len, d_sen, d_sent_len, cnt_sentence);
+    time_collector.uncompress_time_GPU += time_collector.timer_for_part.duration();
+
+    // [debug]检查数据传输是否正确
+    // checkCUDAerr(cudaMemcpy(sen, d_sen, total_len * sizeof(int), cudaMemcpyDeviceToHost));
+    // assert( compressor.check(corpus_data, sen, sentence_length, ori, cnt_sentence, id2offset) );
+
+    // GPU开始训练
+    time_collector.timer_for_part.restart();
+    if (cbow) {
+      cbowKernel(d_sen, d_sent_len, alpha, cnt_sentence, reduSize);
+    } else {
+      sgKernel(d_sen, d_sent_len, d_negSample, alpha, cnt_sentence, reduSize);
+    }
+    // [debug]修改为串行执行->测试时间
+    cudaDeviceSynchronize();
+    time_collector.train_time += time_collector.timer_for_part.duration();
+  }
+  cudaDeviceSynchronize();
+
+  // GPU将训练后的结果传回CPU
+  time_collector.timer_for_part.restart();
+  checkCUDAerr(cudaMemcpy(syn0, d_syn0, vocab_size * layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
+  time_collector.transfer_back_time += time_collector.timer_for_part.duration();
+
+  // 释放空间
+  free(misc_data);free(misc_data_len);free(bitmap);free(bitmap_len);free(sen);free(sentence_length);free(negSample);
+  cudaFree(d_misc_data);cudaFree(d_misc_data_len);cudaFree(d_bitmap);cudaFree(d_bitmap_len);cudaFree(d_sen);cudaFree(d_sent_len);cudaFree(d_negSample);
 }
 
 vector<vertex_id_t> g_v_degree;
@@ -1921,6 +2214,9 @@ double train_spend_time = 0.0;
 
 void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& config) {
   Timer total_init_timer;  // Total initialization timer
+  // time_collector.reset();
+  time_collector.timer_for_total.restart();
+  time_collector.timer_for_part.restart();
   printf("==========================Train Model In=====================\n");
   
   long a, b, c, d;
@@ -1980,8 +2276,8 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
   vertex_id_t last_eva_num = vocab_size;
   int train_iter = 0;
   bool stop_train_flag = false;
-  
-  
+  time_collector.init_time += time_collector.timer_for_part.duration();
+
   while(!stop_train_flag){
     Timer round_timer;  // Timer for entire training round
     Timer wait_timer;
@@ -2003,7 +2299,9 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
     
     MPI_Barrier(MPI_EMB_COMM);// stop sync thread until all the sync thread is ready to be halted
 
+    time_collector.timer_for_train_model.restart();
     TrainModelThreadMemory(corpus_data);  // New function to train with memory data
+    time_collector.train_thread_time += time_collector.timer_for_train_model.duration();
 
     MPI_Barrier(MPI_EMB_COMM);
     pause_sync = true;
@@ -2013,6 +2311,7 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
     }
     std::cout << std::endl;
     
+    time_collector.timer_for_part.restart();
     vertex_id_t eva_num = 0;
     if(train_iter >= init_round){
       // printf("[ %d ] evaluation start (with synchronized embeddings)\n", my_rank);
@@ -2081,6 +2380,7 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
     } else {
       printf("[ %d ]Iter %d Skipping evaluation (init_round=%d)\n",my_rank,train_iter,init_round);
     }
+    time_collector.eva_time += time_collector.timer_for_part.duration();
   }
   
   // OPTIMIZATION: No sync thread to clean up since we disabled training-time sync
@@ -2110,7 +2410,10 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
   cudaFree(d_vocab_code);
 
   MPI_Barrier(MPI_EMB_COMM);// stop sync thread until all the sync thread is ready to be halted
-  if(my_rank != 0) return;
+  if(my_rank != 0) {
+    time_collector.total_time += time_collector.timer_for_total.duration();
+    return;
+  }
 
   std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
@@ -2177,6 +2480,7 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
   std::chrono::duration<double> time_span = std::chrono::duration_cast<std::chrono::duration<double>>(t2-t1);
   std::cout<<"[ "<<my_rank<<" ] Save Embedding: " <<time_span.count() << " s" <<std::endl;
   fclose(fo);
+  time_collector.total_time += time_collector.timer_for_total.duration();
 }
 
 int ArgPos(char *str, int argc, char **argv) {
@@ -2193,6 +2497,7 @@ int ArgPos(char *str, int argc, char **argv) {
 int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,SyncQueue& corpus_q,int _my_rank,myEdgeContainer* csr, const TrainingConfig& config) 
 {
   Timer actual_training_timer;
+  time_collector.reset();
   printf("[ %d ] Starting actual training execution...\n", _my_rank);
 
   char hostname[MPI_MAX_PROCESSOR_NAME];
@@ -2201,6 +2506,7 @@ int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,S
   cout <<_my_rank << " train_corpus_cuda invoke ok\n";
   MPI_Comm_dup(MPI_COMM_WORLD,&MPI_EMB_COMM);
   MPI_Comm_dup(MPI_COMM_WORLD,&MPI_EVA_COMM);
+  MPI_Comm_dup(MPI_COMM_WORLD,&MPI_SYNC_COMM);
   MPI_Comm_size(MPI_EMB_COMM, &num_procs);
   MPI_Comm_rank(MPI_EMB_COMM, &my_rank);
   MPI_Get_processor_name(hostname, &hostname_len);
@@ -2326,6 +2632,7 @@ int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,S
   cudaFree(d_expTable);
   free(last_emb);
   
-
+  time_collector.count++;
+  time_collector.print();
   return 0;
 }

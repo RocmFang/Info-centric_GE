@@ -6,6 +6,10 @@
 #include <vector>
 
 using namespace std;
+
+extern int compress_size;
+extern int avg_length;
+
 class Bitmap {
 private:
     size_t bitSize = 0;
@@ -79,70 +83,79 @@ public:
 
 class CoreCompressedSequence {
 public:
-    Bitmap coreMap;
+    vector<Bitmap> coreMap;
     vector<vertex_id_t> misc_data;
+    int original_size;
 };
 
 using compress_t = vector<CoreCompressedSequence>; 
 
 class CorpusCompressor {
 public:
-    void compressSequence(vector<vertex_id_t> &seq,CoreCompressedSequence& hms) {
+    void compressSequence(const vector<vertex_id_t> &seq, CoreCompressedSequence& hms) {
+        hms.original_size = seq.size();
+
         map<vertex_id_t,int> freq;
+        vector<vertex_id_t> topK_nodes;
         for(size_t i = 0; i < seq.size(); i++){
             freq[seq[i]]++;
         }
-        vertex_id_t freq_max_node;
-        int max_freq = 0;
-        for(const auto& pair: freq){
-            if(pair.second > max_freq){
-                freq_max_node = pair.first;
-                max_freq = pair.second;
-            } 
-        }
-        hms.misc_data.push_back(freq_max_node);
+
+        topKQuickSelect(freq, topK_nodes, compress_size - 1);
+        hms.misc_data.insert(hms.misc_data.end(), topK_nodes.begin(), topK_nodes.end());
+        for(int i = 0;i < compress_size;i++) hms.coreMap.emplace_back();
+
         for(size_t  i = 0; i < seq.size(); i++) {
-            if(seq[i] == freq_max_node){
-                hms.coreMap.set(i);
-                continue;
-            }else{
+            bool hasFound = false;
+            for(int j = 0;j < compress_size - 1 && j < topK_nodes.size();j++) { // [TODO]
+                if(seq[i] == topK_nodes[j]) {
+                    hms.coreMap[j].set(i);
+                    hasFound = true;
+                    break;
+                }
+            }
+
+            if(!hasFound) {
                 hms.misc_data.push_back(seq[i]);
+                hms.coreMap[compress_size - 1].set(i);
             }
         }
     }
 
-    void uncompressSequence(vector<vertex_id_t> &seq,CoreCompressedSequence& hms) {
-        vertex_id_t freq_max_node = hms.misc_data[0];
-        int p = 1;// p misc_data point; the first one is Freq_Peak
+    void uncompressSequence(vector<vertex_id_t> &seq, CoreCompressedSequence& hms) {
+        int p = compress_size - 1;// p misc_data point; the first one is Freq_Peak
         int q = 0; // map point
-        while(q < hms.coreMap.size()){
-            if(hms.coreMap.check(q)){
-                seq.push_back(freq_max_node);
-            }else {
-                seq.push_back(hms.misc_data[p]);
-                p++;
+        while(q < hms.original_size) {
+            for(int i = 0;i < compress_size;i++) {
+                if(hms.coreMap[i].check(q)) {
+                    if(i == compress_size - 1) {
+                        seq.push_back(hms.misc_data[p]);
+                        p++;
+                    } else {
+                        seq.push_back(hms.misc_data[i]);
+                    }
+                    q++;
+                    break;
+                }
             }
-            q++;
-        }
-        while(p < hms.misc_data.size()){
-            seq.push_back(hms.misc_data[p]);
-            p++;
         }
     }
 
-    void compressCorpus(corpus_t &cor, compress_t &cp) {
+    void compressCorpus(const corpus_t &cor, compress_t &cp) {
+        cp.resize(cor.size());
+
+        #pragma omp parallel for
         for(size_t i = 0; i < cor.size(); i++){
-            CoreCompressedSequence hms;
-            compressSequence(cor[i], hms);
-            cp.push_back(hms);
+            compressSequence(cor[i], cp[i]);
         }
     }
 
-    void uncompressCorpus(corpus_t &cor,compress_t& cp) {
+    void uncompressCorpus(corpus_t &cor, compress_t& cp) {
+        cor.resize(cp.size());
+
+        #pragma omp parallel for
         for(size_t i = 0; i < cp.size(); i++){
-            vector<vertex_id_t> seq;
-            uncompressSequence(seq, cp[i]);
-            cor.push_back(seq);
+            uncompressSequence(cor[i], cp[i]);
         }
     }
 
@@ -155,5 +168,88 @@ public:
             cout << endl;
         }
         cout << "====================" << endl;
+    }
+
+    void topKQuickSelect(map<vertex_id_t,int> &m, vector<vertex_id_t> &ans, int k){
+        if(k <= 0) return;
+
+        std::vector<std::pair<vertex_id_t, int>> vec(m.begin(), m.end());
+
+        int pivot_index = 0, left = 0, right = vec.size() - 1;
+        while(left <= right){
+            pivot_index = partition(vec, left, right);
+
+            if(pivot_index == k - 1) break;
+            else if(pivot_index < k - 1) left = pivot_index + 1;
+            else right = pivot_index - 1;
+        }
+
+        for(int i = 0;i < k && i < vec.size();i++) ans.push_back(vec[i].first);
+    }
+
+    int partition(vector<pair<vertex_id_t,int>> &vec, int left, int right){
+        int pivot = vec[right].second;
+        int i = left;
+        for(int j = left; j < right; j++){
+            if(vec[j].second >= pivot){
+                std::swap(vec[i], vec[j]);
+                i++;
+            }
+        }
+        std::swap(vec[i], vec[right]);
+        return i;
+    }
+
+    //===================GPU Uncompress===================
+    void uncompressCorpusGPU(int *misc_data, int *misc_data_len, char *bitmap, int *bitmap_len, int *d_sen, int *d_sent_len, int cnt_sentence);
+
+    bool check(const corpus_t &cor, int *sen, int *sen_len, int corpus_index, int cnt_sentence, const vector<vertex_id_t> &id2offset) {
+        int cnt = 0, all = 0;
+        for(size_t i = corpus_index;i < corpus_index + cnt_sentence;i++){
+            if(cor[i].size() != (sen_len[i+1-corpus_index] - sen_len[i-corpus_index])){
+                cout << "sentence " << i << " length mismatch: " << cor[i].size() << " != " << sen_len[i+1-corpus_index] - sen_len[i-corpus_index] << endl;
+                return false;
+            }
+
+            for(size_t j = 0; j < cor[i].size(); j++){
+                auto word = id2offset[cor[i][j]];
+                if(word != sen[sen_len[i-corpus_index] + j]){
+                    cout << "sentence " << i << " word " << j << " mismatch: " << word << " != " << sen[sen_len[i-corpus_index] + j] << endl;
+                    cnt++;
+                    // return false;
+                }
+                all++;
+            }
+        }
+        cout<< "cnt: " << cnt << " all: " << all << endl; 
+
+        if(cnt > 0) return false;
+
+        cout << "corpus check passed!" << endl;
+        return true;
+    }
+
+    bool check(const corpus_t &corA, const corpus_t &corB) {
+        if(corA.size() != corB.size()) {
+            cout << "corpus size mismatch: " << corA.size() << " != " << corB.size() << endl;
+            return false;
+        }
+
+        for(size_t i = 0; i < corA.size(); i++) {
+            if(corA[i].size() != corB[i].size()) {
+                cout << "sentence " << i << " length mismatch: " << corA[i].size() << " != " << corB[i].size() << endl;
+                return false;
+            }
+
+            for(size_t j = 0; j < corA[i].size(); j++) {
+                if(corA[i][j] != corB[i][j]) {
+                    cout << "sentence " << i << " word " << j << " mismatch: " << corA[i][j] << " != " << corB[i][j] << endl;
+                    return false;
+                }
+            }
+        }
+
+        cout << "corpus check passed!" << endl;
+        return true;
     }
 };

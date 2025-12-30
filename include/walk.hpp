@@ -421,6 +421,7 @@ public:
     size_t saved_origin_size = 0;
     size_t saved_theory_compress_size = 0;
     size_t saved_compress_size = 0;
+    bool compress_size_computed = false;
     
     void get_new_sort()
     {
@@ -729,23 +730,23 @@ public:
                     // Calculate compression statistics before move
                     this->calculateCompressionStats();
                     
-                    // Perform compression test before moving data
-                    compress_t compress_corpus;
-                    CorpusCompressor compressor;
-                    compressor.compressCorpus(this->local_corpus, compress_corpus);
-                    
-                    // Calculate and save actual compression size
-                    this->saved_compress_size = 0;
-                    for(size_t i = 0; i < compress_corpus.size(); i++){
-                        this->saved_compress_size += compress_corpus[i].coreMap.mem_size();
-                        this->saved_compress_size += compress_corpus[i].misc_data.size() * sizeof(vertex_id_t);
-                    }
+                    if(!compress_size_computed) {
+                        this->calculateCompressSize();
+
+                        // [debug]输出压缩点数量
+                        std::cout << "Rank " << get_mpi_rank() << " compress_size: " << compress_size << std::endl;
+
+                        int total_compress_size = 0;
+                        MPI_Allreduce(&compress_size, &total_compress_size, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+                        compress_size = total_compress_size / get_mpi_size();
+
+                        // [debug]输出平均压缩点数量
+                        std::cout << "Rank " << get_mpi_rank() << " average compress_size: " << compress_size << std::endl;
+
+                        compress_size_computed = true;
+                    }  
                     
                     this->out_queue.push(std::move(this->local_corpus));  // Use move semantics to avoid copying
-
-                    corpus_t decompressed_dummy;
-                    compressor.uncompressCorpus(decompressed_dummy, compress_corpus);
-
 
                     cv.notify_one();
 
@@ -1146,5 +1147,46 @@ public:
             if(core_array.size() > 0) saved_theory_compress_size -= core_array[0].second;
             if(core_array.size() > 1) saved_theory_compress_size -= core_array[1].second;
         }
+    }
+
+    void calculateCompressSize() {
+        map<vertex_id_t,int> freq;
+        size_t total_length = 0;
+        double length_avg = 0.0;
+        double threshold = 0.0;
+        compress_size = 0;
+
+        for(size_t i = 0;i < local_corpus.size();i++) {
+            total_length += local_corpus[i].size();
+
+            map<vertex_id_t,int> path_freq;
+            for(size_t j = 0;j < local_corpus[i].size();j++) {
+                path_freq[local_corpus[i][j]]++;
+            }
+            vector<pair<vertex_id_t,int>> path_freq_vec(path_freq.begin(), path_freq.end());
+            sort(path_freq_vec.begin(), path_freq_vec.end(), [](const pair<vertex_id_t,int>& p1, const pair<vertex_id_t,int>& p2) {
+            return p1.second > p2.second;
+            });
+
+            for(int k = 0;k < path_freq_vec.size();k++) {
+                freq[k] += path_freq_vec[k].second;
+            }
+        }
+        length_avg = static_cast<double>(total_length) / static_cast<double>(local_corpus.size());
+        threshold = 1 / length_avg + 0.03125; // + 1/32
+        avg_length = ceil(length_avg);
+
+        // [debug]输出平均路径长度和阈值
+        std::cout << "Rank " << get_mpi_rank() << " length_avg: " << length_avg << " threshold: " << threshold << std::endl;
+
+        for(int i = 0;i < freq.size();i++) {
+            double prob = static_cast<double>(freq[i]) / static_cast<double>(total_length);
+
+            // [debug]输出点及其频率和概率
+            std::cout << "Rank " << get_mpi_rank() << " vertex: " << i << " freq: " << freq[i] << " prob: " << prob << std::endl;
+
+            if(prob > threshold) compress_size++;
+            else break;
+        }compress_size++;
     }
 };
