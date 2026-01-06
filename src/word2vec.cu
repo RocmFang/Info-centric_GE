@@ -263,12 +263,11 @@ struct TrainingConfig {
 // ========================================================
 // GPU OPTIMIZATION CONFIGURATION SWITCHES
 // ========================================================
-// Toggle between original memory-copy batch implementation and GPU-direct implementation
-// Set to true to enable GPU-side direct indexing optimization (eliminates memory copy bottleneck)
-bool use_gpu_direct_indexing = true;
-
-// Toggle between simple and shared-memory optimized kernel for direct indexing
-// Only used when use_gpu_direct_indexing = true
+// Toggle between original memory-copy batch implementation and direct indexing implementation
+// Set to true to enable direct indexing optimization (eliminates memory copy bottleneck)
+bool use_direct_indexing = true;
+// Toggle between GPU and CPU for direct indexing
+bool use_gpu = false;
 
 namespace {
 constexpr uint16_t kFullKeepThreshold = std::numeric_limits<uint16_t>::max();
@@ -2182,6 +2181,118 @@ std::vector<float> batch_node_neighbor_direct_index(
 }
 // ========================================================
 
+// ========================================================
+// CPU-SIDE DIRECT INDEXING IMPLEMENTATION
+// ========================================================
+std::vector<float> batch_node_neighbor_direct_index_CPU(
+    const std::vector<vertex_id_t>& all_nodes,
+    myEdgeContainer* csr,
+    int batch_size,
+    bool use_optimized_kernel) {
+    
+    std::vector<float> all_results;
+    all_results.reserve(all_nodes.size());
+    
+    // printf("[ %d ] CPU Direct Index: Processing %zu nodes (batch_size=%d, optimized=%s)\n", 
+    //        my_rank, all_nodes.size(), batch_size, use_optimized_kernel ? "true" : "false");
+    
+    // Process in chunks to manage CPU memory
+    for(size_t chunk_start = 0; chunk_start < all_nodes.size(); chunk_start += batch_size) {
+        size_t chunk_end = std::min(chunk_start + batch_size, all_nodes.size());
+        size_t chunk_size = chunk_end - chunk_start;
+        
+        // printf("[ %d ] CPU Direct: Processing chunk %zu-%zu (%zu nodes)\n", 
+        //        my_rank, chunk_start, chunk_end-1, chunk_size);
+        
+        // Step 1: Collect all node-neighbor pairs for this chunk
+        std::vector<vertex_id_t> node_ids;
+        std::vector<vertex_id_t> neighbor_ids;
+        std::vector<int> node_eval_counts(chunk_size);
+        std::vector<int> eval_offsets(chunk_size);
+        
+        int total_evaluations = 0;
+        
+        for(size_t i = 0; i < chunk_size; i++) {
+            vertex_id_t v_id = all_nodes[chunk_start + i];
+            
+            // Get neighbor set
+            std::vector<vertex_id_t> neighbor_set;
+            for(auto it = csr->adj_lists[v_id].begin; it < csr->adj_lists[v_id].end; it++) {
+                neighbor_set.push_back(it->neighbour);
+            }
+            
+            // Limit evaluation number
+            int evaluate_num = neighbor_set.size();
+            if(evaluate_num > EVALUATION_NEIGHBOUR_NUM) {
+                evaluate_num = EVALUATION_NEIGHBOUR_NUM;
+                std::random_device rd;
+                std::mt19937 g(rd());
+                std::shuffle(neighbor_set.begin(), neighbor_set.end(), g);
+            }
+            
+            node_eval_counts[i] = evaluate_num;
+            eval_offsets[i] = total_evaluations;
+            
+            // Add node-neighbor pairs
+            for(int j = 0; j < evaluate_num; j++) {
+                node_ids.push_back(v_id);
+                neighbor_ids.push_back(neighbor_set[j]);
+            }
+            
+            total_evaluations += evaluate_num;
+        }
+        
+        if(total_evaluations == 0) {
+            // Add zero results for nodes with no neighbors
+            for(size_t i = 0; i < chunk_size; i++) {
+                all_results.push_back(0.0f);
+            }
+            continue;
+        }
+        
+        // Step 2: CPU Direct Indexing Computation
+        float* h_results = new float[total_evaluations];
+
+        #pragma omp parallel for
+        for(int idx = 0; idx < total_evaluations; idx++) {
+          float dot_product = 0.0f, node_norm = 0.0f, neighbor_norm = 0.0f;
+          for(int i = 0; i < layer1_size; i++) {
+            float ai = syn0[id2offset[node_ids[idx]] * layer1_size + i], bi = syn0[id2offset[neighbor_ids[idx]] * layer1_size + i];
+            dot_product += ai * bi;
+            node_norm += ai * ai;
+            neighbor_norm += bi * bi;
+          }
+          h_results[idx] = dot_product / (sqrtf(node_norm) * sqrtf(neighbor_norm));
+        }
+        
+        // Step 3: Compute average similarity for each node
+        for(size_t i = 0; i < chunk_size; i++) {
+            int evaluate_num = node_eval_counts[i];
+            int offset = eval_offsets[i];
+            
+            if(evaluate_num == 0) {
+                all_results.push_back(0.0f);
+                continue;
+            }
+            
+            float sum_similarity = 0.0f;
+            for(int j = 0; j < evaluate_num; j++) {
+                sum_similarity += h_results[offset + j];
+            }
+            
+            float avg_similarity = sum_similarity / evaluate_num;
+            all_results.push_back(avg_similarity);
+        }
+        
+        // Cleanup CPU memory
+        delete[] h_results;
+    }
+    
+    // printf("[ %d ] CPU Direct Index: Completed processing %zu nodes\n", my_rank, all_results.size());
+    return all_results;
+}
+// ========================================================
+
 float find_supernode_topK_accurancy(float p,int k,myEdgeContainer*csr){
   float top_sum = 0;
   for(vertex_id_t v_i = 0; v_i < vocab_size*0.03; v_i ++){
@@ -2331,10 +2442,12 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
         // Step 2: Batch process all nodes with configurable implementation
         std::vector<float> similarities;
         
-        if(use_gpu_direct_indexing) {
-          // NEW: GPU-side direct indexing (eliminates memory copy bottleneck)
-          // printf("[ %d ] Using GPU Direct Indexing optimization\n", my_rank);
-          similarities = batch_node_neighbor_direct_index(
+        if(use_direct_indexing) {
+          // NEW: Direct indexing (eliminates memory copy bottleneck)
+          // printf("[ %d ] Using Direct Indexing optimization\n", my_rank);
+          if(use_gpu) similarities = batch_node_neighbor_direct_index(
+            nodes_to_evaluate, csr, batch_size, use_optimized_direct_kernel);
+          else similarities = batch_node_neighbor_direct_index_CPU(
             nodes_to_evaluate, csr, batch_size, use_optimized_direct_kernel);
         } else {
           // ORIGINAL: Memory copy based batch processing (preserved for comparison)
