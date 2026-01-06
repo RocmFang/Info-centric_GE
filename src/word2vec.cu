@@ -31,7 +31,9 @@
 
 extern int my_rank;
 int compress_size = 4 + 1;
+int min_length = 1001;
 int avg_length = 20;
+int max_length = 0;
 
 using std::vector;
 using std::string;
@@ -509,26 +511,38 @@ void  compute_kl_from_emb(float *emb1, float *emb2,float* h_result, long long v,
 template<unsigned int VSIZE>
 __global__ void __sgNegReuse(const int window, const int layer1_size, const int negative, const int vocab_size, float alpha,
     const int* __restrict__ sen, const int* __restrict__ sentence_length,
-    float *syn1, float *syn0, const int *negSample)
+    float *syn1, float *syn0, const int *negSample, const int max_length, const int cnt_sentence)
 {
   __shared__ float neu1e[VSIZE];
 
   const int sentIdx_s = sentence_length[blockIdx.x];
   const int sentIdx_e = sentence_length[blockIdx.x + 1];
+
+  const int anotherIdx = blockIdx.x + 1 - ((blockIdx.x & 1) << 1);
+  const bool flag = (anotherIdx < 0) || (anotherIdx >= cnt_sentence);
+  int sentIdx_s_another, sentIdx_e_another;
+  if(!flag){
+    sentIdx_s_another = sentence_length[anotherIdx];
+    sentIdx_e_another = sentence_length[anotherIdx + 1];
+  }
+
   const int tid = threadIdx.x + blockDim.x * threadIdx.y;
   const int dxy = blockDim.x * blockDim.y;
 
   int _negSample;
-  if (threadIdx.y < negative) {                                         // Get the negative sample
-    _negSample = negSample[blockIdx.x * negative + threadIdx.y];
-  }
 
   for (int sentPos = sentIdx_s; sentPos < sentIdx_e; sentPos++) {
     int word = sen[sentPos];                                            // Target word
+    int word_another;
+    if (!flag) word_another = sen[sentPos - sentIdx_s + sentIdx_s_another]; // Negative word from another sentence
     if (word == -1) continue;
 
+    if (threadIdx.y < negative) {                                         // Get the negative sample
+      _negSample = negSample[(blockIdx.x / 2 * max_length + sentPos - sentIdx_s) * negative + threadIdx.y];
+    }
+
     for (int a=0; a<window*2+1; a++) if (a != window) {
-      int c = sentPos - window + a;                                     // The index of context word
+      int c = sentPos - window + a;                                     // The index of context word      
       if (c >= sentIdx_s && c < sentIdx_e && sen[c] != -1) {
         int l1 = sen[c] * layer1_size;
 
@@ -542,6 +556,10 @@ __global__ void __sgNegReuse(const int window, const int layer1_size, const int 
         if (threadIdx.y == negative) {                                  // Positive sample
           target = word;
           label = 1;
+        } else if (threadIdx.y == negative + 1) {                       // Negative samples
+          if (flag || ((sentPos - sentIdx_s) >= (sentIdx_e_another - sentIdx_s_another)) || word == -1) goto NEGOUT;
+          target = word;
+          label = 0;
         } else {                                                        // Negative samples
           if (_negSample == word) goto NEGOUT;
           target = _negSample;
@@ -1069,45 +1087,45 @@ void cbowKernel(int *d_sen, int *d_sent_len, float alpha, int cnt_sentence, int 
 
 }
 
-void sgKernel(int *d_sen, int *d_sent_len, int *d_negSample, float alpha, int cnt_sentence, int reduSize)
+void sgKernel(int *d_sen, int *d_sent_len, int *d_negSample, float alpha, int cnt_sentence, int reduSize, int max_length)
 {
   int bDim= layer1_size;
   int gDim= cnt_sentence;
 
   if (reuseNeg) { // A sentence share negative samples
-    dim3 bDimNeg(32, negative+1, 1);
+    dim3 bDimNeg(32, negative+1+1, 1);
     switch(layer1_size) {
       case 1: __sgNegReuse<1><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       case 10: __sgNegReuse<10><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       case 20: __sgNegReuse<20><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       case 50: __sgNegReuse<50><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       case 100: __sgNegReuse<100><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       case 200: __sgNegReuse<200><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       case 300: __sgNegReuse<300><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       case 128: __sgNegReuse<128><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
                 break;
       default: printf("Can't support on vector size = %lld\n", layer1_size);
                exit(1);
@@ -1385,7 +1403,7 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
     if (cbow) {
       cbowKernel(d_sen, d_sent_len, alpha, cnt_sentence, reduSize);
     } else {
-      sgKernel(d_sen, d_sent_len, d_negSample, alpha, cnt_sentence, reduSize);
+      sgKernel(d_sen, d_sent_len, d_negSample, alpha, cnt_sentence, reduSize, max_length);
     }
 
   }
@@ -1546,7 +1564,7 @@ void TrainModelThreadMemory_CompressCorpus(const corpus_t& corpus_data)
     if (cbow) {
       cbowKernel(d_sen, d_sent_len, alpha, cnt_sentence, reduSize);
     } else {
-      sgKernel(d_sen, d_sent_len, d_negSample, alpha, cnt_sentence, reduSize);
+      sgKernel(d_sen, d_sent_len, d_negSample, alpha, cnt_sentence, reduSize, max_length);
     }
     // [debug]修改为串行执行->测试时间
     cudaDeviceSynchronize();

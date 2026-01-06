@@ -8,7 +8,9 @@
 using namespace std;
 
 extern int compress_size;
+extern int min_length;
 extern int avg_length;
+extern int max_length;
 
 class Bitmap {
 private:

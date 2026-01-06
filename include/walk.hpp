@@ -1158,6 +1158,8 @@ public:
         compress_size = 0;
 
         for(size_t i = 0;i < local_corpus.size();i++) {
+            min_length = std::min(min_length, static_cast<int>(local_corpus[i].size()));
+            max_length = std::max(max_length, static_cast<int>(local_corpus[i].size()));
             total_length += local_corpus[i].size();
 
             map<vertex_id_t,int> path_freq;
@@ -1177,8 +1179,9 @@ public:
         threshold = 1 / length_avg + 0.03125; // + 1/32
         avg_length = ceil(length_avg);
 
-        // [debug]输出平均路径长度和阈值
+        // [debug]输出平均路径长度和阈值、长度极值
         std::cout << "Rank " << get_mpi_rank() << " length_avg: " << length_avg << " threshold: " << threshold << std::endl;
+        std::cout << "Rank " << get_mpi_rank() << " min_length: " << min_length << " max_length: " << max_length << std::endl;
 
         for(int i = 0;i < freq.size();i++) {
             double prob = static_cast<double>(freq[i]) / static_cast<double>(total_length);
@@ -1188,6 +1191,6 @@ public:
 
             if(prob > threshold) compress_size++;
             else break;
-        }compress_size++;
+        } compress_size++;
     }
 };
