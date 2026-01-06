@@ -30,10 +30,6 @@
 #include <mpi.h>
 
 extern int my_rank;
-int compress_size = 4 + 1;
-int min_length = 1001;
-int avg_length = 20;
-int max_length = 0;
 
 using std::vector;
 using std::string;
@@ -59,6 +55,11 @@ using std::endl;
     exit(0);\
   }\
 }
+
+int compress_size = 4 + 1;
+int min_length = MAX_SENTENCE_LENGTH + 1;
+int avg_length = 50;
+int max_length = 0;
 
 class TimeCollector {
 public:
@@ -308,10 +309,13 @@ long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
 long long train_words = 0, word_count_actual = 0, iter = 5, classes = 0;
 float alpha = 0.025, starting_alpha, sample = 1e-3;
 float *syn0, *syn1, *syn1neg, *expTable;
+int *syn0_id2offset, *syn1_id2offset;
+int syn0_num = 0, syn1_num = 0;
 clock_t start;
 
 int hs = 0, negative = 5;
 const int table_size = 1e8;
+const int syn_size = 1e7;
 int *table;
 
 // FOR CUDA
@@ -319,6 +323,7 @@ int *vocab_codelen, *vocab_point, *d_vocab_codelen, *d_vocab_point;
 char *vocab_code, *d_vocab_code;
 int *d_table;
 float *d_syn0, *d_syn1, *d_expTable;
+int *d_syn0_id2offset, *d_syn1_id2offset;
 
 static std::vector<uint16_t> BuildSubsamplingThresholds(double sample_value, long long total_train_words) {
   std::vector<uint16_t> thresholds;
@@ -511,7 +516,7 @@ void  compute_kl_from_emb(float *emb1, float *emb2,float* h_result, long long v,
 template<unsigned int VSIZE>
 __global__ void __sgNegReuse(const int window, const int layer1_size, const int negative, const int vocab_size, float alpha,
     const int* __restrict__ sen, const int* __restrict__ sentence_length,
-    float *syn1, float *syn0, const int *negSample, const int max_length, const int cnt_sentence)
+    float *syn1, float *syn0, const int *negSample, const int max_length, const int cnt_sentence, int *syn0_id2offset)
 {
   __shared__ float neu1e[VSIZE];
 
@@ -544,7 +549,7 @@ __global__ void __sgNegReuse(const int window, const int layer1_size, const int 
     for (int a=0; a<window*2+1; a++) if (a != window) {
       int c = sentPos - window + a;                                     // The index of context word      
       if (c >= sentIdx_s && c < sentIdx_e && sen[c] != -1) {
-        int l1 = sen[c] * layer1_size;
+        int l1 = syn0_id2offset[sen[c]] * layer1_size;
 
         for (int i=tid; i<layer1_size; i+=dxy) {
           neu1e[i] = 0;
@@ -602,7 +607,7 @@ template<unsigned int FSIZE>
 __global__ void skip_gram_kernel(int window, int layer1_size, int negative, int hs, int table_size, int vocab_size, float alpha,
     const float* __restrict__ expTable, const int* __restrict__ table, 
     const int* __restrict__ vocab_codelen, const int* __restrict__ vocab_point, const char* __restrict__ vocab_code,
-    const int* __restrict__ sen, const int* __restrict__ sentence_length, float *syn1, float *syn0)
+    const int* __restrict__ sen, const int* __restrict__ sentence_length, float *syn1, float *syn0, int *syn0_id2offset)
 {
   __shared__ float f[FSIZE], g;
 
@@ -623,7 +628,7 @@ __global__ void skip_gram_kernel(int window, int layer1_size, int negative, int 
       if (c >= sent_idx_e) continue;
       int last_word = sen[c];
       if (last_word == -1) continue;
-      int l1 = last_word * layer1_size;
+      int l1 = syn0_id2offset[last_word] * layer1_size;
       neu1e = 0;
 
       // HIERARCHICAL SOFTMAX
@@ -698,7 +703,7 @@ template<unsigned int FSIZE>
 __global__ void cbow_kernel(int window, int layer1_size, int negative, int hs, int table_size, int vocab_size, float alpha,
     const float* __restrict__ expTable, const int* __restrict__ table,
     const int* __restrict__ vocab_codelen, const int* __restrict__ vocab_point, const char* __restrict__ vocab_code,
-    const int* __restrict__ sen, const int* __restrict__ sentence_length, float *syn1, float *syn0)
+    const int* __restrict__ sen, const int* __restrict__ sentence_length, float *syn1, float *syn0, int *syn0_id2offset)
 {
   __shared__ float f[FSIZE], g;
 
@@ -721,7 +726,7 @@ __global__ void cbow_kernel(int window, int layer1_size, int negative, int hs, i
       if (c >= sent_idx_e) continue;
       int last_word = sen[c];
       if (last_word == -1) continue;
-      neu1 += syn0[last_word * layer1_size + threadIdx.x];
+      neu1 += syn0[syn0_id2offset[last_word] * layer1_size + threadIdx.x];
       cw++;
     }
 
@@ -798,7 +803,7 @@ __global__ void cbow_kernel(int window, int layer1_size, int negative, int hs, i
         if (c >= sent_idx_e) continue;
         int last_word = sen[c];
         if (last_word == -1) continue;
-        atomicAdd(&syn0[last_word * layer1_size + threadIdx.x], neu1e);
+        atomicAdd(&syn0[syn0_id2offset[last_word] * layer1_size + threadIdx.x], neu1e);
       }
     }
   }
@@ -1036,26 +1041,48 @@ void InitNet() {
     if (syn1 == NULL) {printf("Memory allocation failed\n"); exit(1);}
     for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
       syn1[a * layer1_size + b] = 0;
-    checkCUDAerr(cudaMalloc((void **)&d_syn1, (long long)vocab_size * layer1_size * sizeof(float)));
 
-    checkCUDAerr(cudaMemcpy(d_syn1, syn1, (long long)vocab_size * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+    // if(vocab_size <= syn_size) {
+      checkCUDAerr(cudaMalloc((void **)&d_syn1, (long long)vocab_size * layer1_size * sizeof(float)));
+      checkCUDAerr(cudaMemcpy(d_syn1, syn1, (long long)vocab_size * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+    // } else checkCUDAerr(cudaMalloc((void **)&d_syn1, (long long)syn_size * layer1_size * sizeof(float)));
+
   }
   if (negative>0) {
     a = posix_memalign((void **)&syn1neg, 128, (long long)vocab_size * layer1_size * sizeof(float));
     if (syn1neg == NULL) {printf("Memory allocation failed\n"); exit(1);}
     for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
       syn1neg[a * layer1_size + b] = 0;
-    checkCUDAerr(cudaMalloc((void **)&d_syn1, (long long)vocab_size * layer1_size * sizeof(float)));
 
-    checkCUDAerr(cudaMemcpy(d_syn1, syn1neg, (long long)vocab_size * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+    // if(vocab_size <= syn_size) {
+      checkCUDAerr(cudaMalloc((void **)&d_syn1, (long long)vocab_size * layer1_size * sizeof(float)));
+      checkCUDAerr(cudaMemcpy(d_syn1, syn1neg, (long long)vocab_size * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+    // } else checkCUDAerr(cudaMalloc((void **)&d_syn1, (long long)syn_size * layer1_size * sizeof(float)));
+    
   }
   for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++) {
     next_random = next_random * (unsigned long long)25214903917 + 11;
     syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (float)65536) - 0.5) / layer1_size;
   }
-  checkCUDAerr(cudaMalloc((void **)&d_syn0, (long long)vocab_size * layer1_size * sizeof(float)));
+  if(vocab_size <= syn_size) {
+    checkCUDAerr(cudaMalloc((void **)&d_syn0, (long long)vocab_size * layer1_size * sizeof(float)));
+    checkCUDAerr(cudaMemcpy(d_syn0, syn0, (long long)vocab_size * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+  } else checkCUDAerr(cudaMalloc((void **)&d_syn0, (long long)syn_size * layer1_size * sizeof(float)));
 
-  checkCUDAerr(cudaMemcpy(d_syn0, syn0, (long long)vocab_size * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+
+  a = posix_memalign((void **)&syn0_id2offset, 128, (long long)vocab_size * sizeof(int));
+  if (syn0_id2offset == NULL) {printf("Memory allocation failed\n"); exit(1);}
+  // a = posix_memalign((void **)&syn1_id2offset, 128, (long long)vocab_size * sizeof(int));
+  // if (syn1_id2offset == NULL) {printf("Memory allocation failed\n"); exit(1);}
+  checkCUDAerr(cudaMalloc((void **)&d_syn0_id2offset, (long long)vocab_size * sizeof(int)));
+  // checkCUDAerr(cudaMalloc((void **)&d_syn1_id2offset, (long long)vocab_size * sizeof(int)));
+  if(vocab_size <= syn_size) {
+    std::iota(syn0_id2offset, syn0_id2offset + vocab_size, 0);
+    syn0_num = vocab_size;
+  } else memset(syn0_id2offset, -1, (long long)vocab_size * sizeof(int));
+  // memcpy(syn1_id2offset, syn0_id2offset, vocab_size * sizeof(int));
+  checkCUDAerr(cudaMemcpy(d_syn0_id2offset, syn0_id2offset, (long long)vocab_size * sizeof(int), cudaMemcpyHostToDevice));
+  // checkCUDAerr(cudaMemcpy(d_syn1_id2offset, syn1_id2offset, (long long)vocab_size * sizeof(int), cudaMemcpyHostToDevice));
 
   CreateBinaryTree();
 }
@@ -1068,17 +1095,17 @@ void cbowKernel(int *d_sen, int *d_sent_len, float alpha, int cnt_sentence, int 
     case 128: cbow_kernel<64><<<gDim, bDim>>>
               (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-               d_sen, d_sent_len, d_syn1, d_syn0);
+               d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
               break;
     case 256: cbow_kernel<128><<<gDim, bDim>>>
               (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-               d_sen, d_sent_len, d_syn1, d_syn0);
+               d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
               break;
     case 512: cbow_kernel<256><<<gDim, bDim>>>
               (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-               d_sen, d_sent_len, d_syn1, d_syn0);
+               d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
               break;
     default: printf("Can't support on vector size = %lld\n", layer1_size);
              exit(1);
@@ -1097,35 +1124,35 @@ void sgKernel(int *d_sen, int *d_sent_len, int *d_negSample, float alpha, int cn
     switch(layer1_size) {
       case 1: __sgNegReuse<1><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       case 10: __sgNegReuse<10><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       case 20: __sgNegReuse<20><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       case 50: __sgNegReuse<50><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       case 100: __sgNegReuse<100><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       case 200: __sgNegReuse<200><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       case 300: __sgNegReuse<300><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       case 128: __sgNegReuse<128><<<gDim, bDimNeg>>>
                 (window, layer1_size, negative, vocab_size, alpha,
-                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_negSample, max_length, cnt_sentence, d_syn0_id2offset);
                 break;
       default: printf("Can't support on vector size = %lld\n", layer1_size);
                exit(1);
@@ -1136,27 +1163,27 @@ void sgKernel(int *d_sen, int *d_sent_len, int *d_negSample, float alpha, int cn
       case 32: skip_gram_kernel<16><<<gDim, bDim>>>
                 (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                 d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-                d_sen, d_sent_len, d_syn1, d_syn0);
+                d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
                 break;
       case 64: skip_gram_kernel<32><<<gDim, bDim>>>
                 (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                 d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-                d_sen, d_sent_len, d_syn1, d_syn0);
+                d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
                 break;
       case 128: skip_gram_kernel<64><<<gDim, bDim>>>
                 (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                  d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-                 d_sen, d_sent_len, d_syn1, d_syn0);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
                 break;
       case 256: skip_gram_kernel<128><<<gDim, bDim>>>
                 (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                  d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-                 d_sen, d_sent_len, d_syn1, d_syn0);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
                 break;
       case 512: skip_gram_kernel<256><<<gDim, bDim>>>
                 (window, layer1_size, negative, hs, table_size, vocab_size, alpha,
                  d_expTable, d_table, d_vocab_codelen, d_vocab_point, d_vocab_code,
-                 d_sen, d_sent_len, d_syn1, d_syn0);
+                 d_sen, d_sent_len, d_syn1, d_syn0, d_syn0_id2offset);
                 break;
       default: printf("Can't support on vector size = %lld\n", layer1_size);
                exit(1);
@@ -1185,9 +1212,7 @@ double sync_spend_time = 0.0f;
 void sync_embedding_func()
 {
   // Skip synchronization in single-process runs
-  if (num_procs == 1) {
-    return;
-  }
+  if (num_procs == 1) return;
   
   Timer sync_timer;
   int wait_time = 1000;
@@ -1196,12 +1221,8 @@ void sync_embedding_func()
   while(!halt_sync)
   {
     sleep(wait_time/1000);
-    // usleep(100000); // 100ms instead of 1s for faster sync frequency
-    // if(true == pause_sync) {
-    //   syncTime = chrono::steady_clock::now() + chrono::milliseconds(1000); // next sync time.
-    // }
-    unique_lock<std::mutex> lock(sync_mtx);
     //wait_until syncTime.
+    unique_lock<std::mutex> lock(sync_mtx);
     sync_cv.wait_until(lock,syncTime);
 
     if(halt_sync == true) break;
@@ -1214,17 +1235,8 @@ void sync_embedding_func()
     trainBlocked = true;
 
     sync_timer.restart();
-    // all_sync();
-    sync_spend_time += sync_timer.duration();
-
-    // trainBlocked = false; // unblock the training thread.
-    // sync_cv.notify_one(); // wake trainer
-    // printf("[ %d ] Full sync completed, sync times: %d\n", my_rank, sync_times++);
-    // syncTime = chrono::steady_clock::now() + chrono::milliseconds(1000); // next sync time
-    // continue; // Move to the next sync round and skip the remaining steps
-    
-    // copyFrom GPU, MPI, write back to GPU 
-    //  No.1 pick up the sync id;
+    // CPU or GPU -> buffer -> MPI -> buffer -> CPU or GPU
+    // No.1 pick up the sync id;
     int sync_node_num;
     vector<vertex_id_t> sync_vocab_id_array; // vocab id is not node id. It's the idx in the vpcab
     if(my_rank == 0)
@@ -1232,7 +1244,7 @@ void sync_embedding_func()
       vector<vertex_id_t> degree_range(vocab_size);
       degree_range[0] = 0;
       vertex_id_t n = 1;
-      for(vertex_id_t vi = 1; vi < vocab_size;vi++){
+      for(vertex_id_t vi = 1; vi < vocab_size;vi++){//TODO
         if(vocab[vi].cn != vocab[vi-1].cn){
           degree_range[n] = vi;
           n++;
@@ -1250,45 +1262,97 @@ void sync_embedding_func()
     }
     // broadcast sync id amount
     MPI_Bcast(&sync_node_num,1,get_mpi_data_type<int>(),0,MPI_SYNC_COMM);
-    if(my_rank != 0)
-    {
-      sync_vocab_id_array.resize(sync_node_num);
-    }
+    if(my_rank != 0) sync_vocab_id_array.resize(sync_node_num);
     MPI_Bcast(sync_vocab_id_array.data(), sync_node_num, get_mpi_data_type<int>(), 0, MPI_SYNC_COMM);
     // printf("[ %d ] sync_vocab_id_array size: %ld\n",my_rank,sync_vocab_id_array.size());
+
     // embedding buffer
     float *h_sync_emb_buffer = (float*)malloc(sync_node_num * layer1_size *sizeof(float));
     if(h_sync_emb_buffer == NULL){
       printf("[ %d ] ERROR. malloc h_sync_emb_buffer fail\n",my_rank);
     }
-    // load specific embedding from GPU 
-    for(vertex_id_t i =0; i < sync_vocab_id_array.size();i++){
-      checkCUDAerr(cudaMemcpy(h_sync_emb_buffer+i *layer1_size,
-            d_syn0 + sync_vocab_id_array[i]*layer1_size,
-            layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
+    // load specific embedding from CPU or GPU
+    for(vertex_id_t i = 0; i < sync_vocab_id_array.size(); i++){
+      if(syn0_id2offset[sync_vocab_id_array[i]] != -1){ // in GPU
+        checkCUDAerr(cudaMemcpy(h_sync_emb_buffer + i*layer1_size,
+                                d_syn0 + syn0_id2offset[sync_vocab_id_array[i]]*layer1_size,
+                                layer1_size * sizeof(float),
+                                cudaMemcpyDeviceToHost));
+      }
+      else{ // in CPU
+        memcpy(h_sync_emb_buffer + i*layer1_size,
+              syn0 + sync_vocab_id_array[i]*layer1_size,
+              layer1_size * sizeof(float));
+      }
     }
-    checkCUDAerr(cudaDeviceSynchronize());
-    // synchronize
-    MPI_Allreduce(MPI_IN_PLACE, h_sync_emb_buffer,sync_node_num * layer1_size , MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
+    MPI_Allreduce(MPI_IN_PLACE, h_sync_emb_buffer, sync_node_num * layer1_size, MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
     for(vertex_id_t i = 0; i < sync_node_num * layer1_size; i++){
       h_sync_emb_buffer[i] /= num_procs;
     }
-    // write back to the GPU 
-    for(vertex_id_t i =0; i < sync_vocab_id_array.size();i++){
-      checkCUDAerr(cudaMemcpy( d_syn0 +sync_vocab_id_array[i]*layer1_size,
-            h_sync_emb_buffer+i *layer1_size,
-            layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+    // write back to the CPU or GPU
+    for(vertex_id_t i = 0; i < sync_vocab_id_array.size(); i++){
+      if(syn0_id2offset[sync_vocab_id_array[i]] != -1){ // in GPU
+        checkCUDAerr(cudaMemcpy(d_syn0 + syn0_id2offset[sync_vocab_id_array[i]]*layer1_size,
+                                h_sync_emb_buffer + i*layer1_size,
+                                layer1_size * sizeof(float),
+                                cudaMemcpyHostToDevice));
+      }
+      else{ // in CPU
+        memcpy(syn0 + sync_vocab_id_array[i]*layer1_size,
+              h_sync_emb_buffer + i*layer1_size,
+              layer1_size * sizeof(float));
+      }
     }
-    checkCUDAerr(cudaDeviceSynchronize());
     sync_spend_time += sync_timer.duration(); 
     syncTime = chrono::steady_clock::now() + chrono::milliseconds(wait_time); // next sync time.
     trainBlocked = false; // unblock the traing thread.
     sync_cv.notify_one(); // wake trainer
-    // printf("[ %d ] Syncing Times No.%d, sync %d nodes\n",my_rank,sync_times++, sync_node_num);
+    // printf("[ %d ] Syncing Times No.%d, sync %d nodes\n", my_rank, sync_times++, sync_node_num);
   }
 }
 
 LR *lr_scheduler;
+const int stream_num = 4;
+vector<cudaStream_t> streams(stream_num);
+float *pinned_buffer;
+
+void write_back(float *syn, float *d_syn, int *syn_id2offset) {
+  // 收集需要写回的位置
+  vector<pair<vertex_id_t, vertex_id_t>> sync_list;
+  for(vertex_id_t i = 0; i < vocab_size; i++) {
+    if(syn_id2offset[i] != -1) {
+      sync_list.emplace_back(i, syn_id2offset[i]);
+    }
+  }
+
+  if(sync_list.empty()) return;
+
+  // 分配页锁定内存进行异步拷贝
+  size_t segment_size = (sync_list.size() + stream_num - 1) / stream_num;
+  for(size_t i = 0; i < stream_num; i++) {
+    size_t current_segment_size = min(segment_size, sync_list.size() - i * segment_size);
+    if(current_segment_size == 0) break;
+    checkCUDAerr(cudaMemcpyAsync(pinned_buffer + i * segment_size * layer1_size,
+                                 d_syn + i * segment_size * layer1_size,
+                                 current_segment_size * layer1_size * sizeof(float),
+                                 cudaMemcpyDeviceToHost,
+                                 streams[i]));
+  }
+
+  for(int i = 0; i < stream_num; i++) {
+    checkCUDAerr(cudaStreamSynchronize(streams[i]));
+  }
+
+  // 写回内存
+  #pragma omp parallel for schedule(static)
+  for(size_t i = 0; i < sync_list.size(); i++) {
+    auto &idx = sync_list[i];
+    memcpy(syn + idx.first * layer1_size,
+           pinned_buffer + idx.second * layer1_size,
+           layer1_size * sizeof(float));
+  }
+}
+
 void TrainModelThreadMemory(const corpus_t& corpus_data)
 {
   printf("[ p%d ]=====================Train memory corpus (size: %zu)============\n", my_rank, corpus_data.size());
@@ -1298,9 +1362,12 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
   // use in kernel
   int total_sent_len, reduSize = 32, total_capacity = MAX_SENTENCE * avg_length;
   int *sen, *sentence_length, *d_sen, *d_sent_len, *negSample, *d_negSample;
+  float *syn0_buffer;
+
   sen = (int *)malloc(total_capacity * sizeof(int));
   sentence_length = (int *)malloc((MAX_SENTENCE + 1) * sizeof(int));
   negSample = (int *)malloc(MAX_SENTENCE * max_length * negative * sizeof(int));
+  syn0_buffer = (float *)malloc(MAX_SENTENCE * max_length * layer1_size * sizeof(float));
 
   checkCUDAerr(cudaMalloc((void **)&d_sen, total_capacity * sizeof(int)));
   checkCUDAerr(cudaMalloc((void **)&d_sent_len, (MAX_SENTENCE + 1) * sizeof(int)));
@@ -1318,8 +1385,6 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
 
   // Process corpus data directly from memory instead of reading from file
   size_t corpus_index = 0;
-
-  
   while (corpus_index < corpus_data.size()) {
     // Only wait for synchronization when running across multiple processes
     // OPTIMIZATION: No need to wait for sync during training
@@ -1341,8 +1406,8 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
     
     total_sent_len = 0;
     sentence_length[0] = 0;
-    int cnt_sentence = 0;
-
+    int cnt_sentence = 0, syn0_idx = 0;
+    bool write_back_flag = false;
 
     while (cnt_sentence < MAX_SENTENCE && corpus_index < corpus_data.size()) {
       const auto& sequence = corpus_data[corpus_index];
@@ -1367,6 +1432,12 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
         //   }
         // }
 
+        if(vocab_size > syn_size && syn0_id2offset[word] == -1) {
+          syn0_id2offset[word] = syn0_num;
+          memcpy(syn0_buffer + syn0_idx * layer1_size, syn0 + word * layer1_size, layer1_size * sizeof(float));
+          syn0_num++, syn0_idx++;
+        }
+
         sen[total_sent_len] = word;
         total_sent_len++;
         temp_sent_len++;
@@ -1377,6 +1448,7 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
       sentence_length[cnt_sentence] = total_sent_len;
       corpus_index++;
       if ((total_capacity - total_sent_len) < max_length) break;
+      if (vocab_size > syn_size && (syn_size - syn0_num) < max_length) {write_back_flag = true; break;} // GPU syn0 buffer full
     }
 
     if (cnt_sentence == 0) break;
@@ -1401,6 +1473,10 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
     checkCUDAerr(cudaMemcpy(d_sen, sen, total_sent_len * sizeof(int), cudaMemcpyHostToDevice));
     checkCUDAerr(cudaMemcpy(d_sent_len, sentence_length, (cnt_sentence + 1) * sizeof(int), cudaMemcpyHostToDevice));
     checkCUDAerr(cudaMemcpy(d_negSample, negSample, cnt_sentence * max_length * negative * sizeof(int), cudaMemcpyHostToDevice));
+    if(vocab_size > syn_size){
+      checkCUDAerr(cudaMemcpy(d_syn0 + (syn0_num - syn0_idx) * layer1_size, syn0_buffer, syn0_idx * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
+      checkCUDAerr(cudaMemcpy(d_syn0_id2offset, syn0_id2offset, vocab_size * sizeof(int), cudaMemcpyHostToDevice));
+    }
 
     if (cbow) {
       cbowKernel(d_sen, d_sent_len, alpha, cnt_sentence, reduSize);
@@ -1408,10 +1484,12 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
       sgKernel(d_sen, d_sent_len, d_negSample, alpha, cnt_sentence, reduSize, max_length);
     }
 
+    if(write_back_flag) {cudaDeviceSynchronize();write_back(syn0, d_syn0, syn0_id2offset); syn0_num = 0; memset(syn0_id2offset, -1, vocab_size * sizeof(int));}
   }
   cudaDeviceSynchronize();
 
-  checkCUDAerr(cudaMemcpy(syn0, d_syn0, vocab_size * layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
+  if(vocab_size > syn_size) write_back(syn0, d_syn0, syn0_id2offset);
+  else checkCUDAerr(cudaMemcpy(syn0, d_syn0, vocab_size * layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
 
   // free memory
   free(sen);
@@ -2375,6 +2453,11 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
   
   if (hs > 0) InitVocabStructCUDA();
   if (negative > 0) InitUnigramTable();
+
+  // for write_back
+  for(int i = 0; i < stream_num; i++) {
+    checkCUDAerr(cudaStreamCreate(&streams[i]));
+  } checkCUDAerr(cudaMallocHost((void **)&pinned_buffer, syn_size * layer1_size * sizeof(float)));
 
   start = clock();
   srand(time(NULL));
