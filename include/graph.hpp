@@ -1484,35 +1484,22 @@ public:
             std::vector<MPI_Request*> requests[partition_num];
             auto recv_func = [&] (partition_id_t src)
             {
-                MPI_Status prob_status0;
-                MPI_Probe(src, Tag_Msg_Count, MPI_COMM_WORLD, &prob_status0);
-                int sz0;
-                MPI_Get_count(&prob_status0, get_mpi_data_type<char>(), &sz0);
-                
-                MPI_Request *recv_req0 = new MPI_Request();
-                requests[src].push_back(recv_req0);
-                int count = 0;
-                MPI_Irecv(&count, 1 , get_mpi_data_type<int>(), src, Tag_Msg_Count, MPI_COMM_WORLD, recv_req0);
-                printf("received%d\n", count);
-
-                for(int i = 0; i < count; i++){
-                    MPI_Status prob_status;
-                    MPI_Probe(src, Tag_Msg, MPI_COMM_WORLD, &prob_status);
-                    int sz;
-                    MPI_Get_count(&prob_status, get_mpi_data_type<char>(), &sz);
-                    printf("recv %u <- %u: %zu\n", local_partition_id, src, sz / sizeof(msg_t));
-                    MPI_Request *recv_req = new MPI_Request();
-                    requests[src].push_back(recv_req);
-                    if (zero_copy_data == nullptr)
-                    {
-                        MPI_Irecv(((msg_t*)msg_recv_buffer[src]->data) + msg_recv_buffer[src]->count, sz, get_mpi_data_type<char>(), src, Tag_Msg, MPI_COMM_WORLD, recv_req);
-                        msg_recv_buffer[src]->count += sz / sizeof(msg_t);
-                        msg_recv_buffer[src]->template self_check<msg_t>();
-                    } else
-                    {
-                        MPI_Irecv(zero_copy_data + zero_copy_recv_count, sz, get_mpi_data_type<char>(), src, Tag_Msg, MPI_COMM_WORLD, recv_req);
-                        zero_copy_recv_count += sz / sizeof(msg_t);
-                    }
+                MPI_Status prob_status;
+                MPI_Probe(src, Tag_Msg, MPI_COMM_WORLD, &prob_status);
+                int sz;
+                MPI_Get_count(&prob_status, get_mpi_data_type<char>(), &sz);
+                // printf("recv %u <- %u: %zu\n", local_partition_id, src, sz / sizeof(msg_t));
+                MPI_Request *recv_req = new MPI_Request();
+                requests[src].push_back(recv_req);
+                if (zero_copy_data == nullptr)
+                {
+                    MPI_Irecv(((msg_t*)msg_recv_buffer[src]->data) + msg_recv_buffer[src]->count, sz, get_mpi_data_type<char>(), src, Tag_Msg, MPI_COMM_WORLD, recv_req);
+                    msg_recv_buffer[src]->count += sz / sizeof(msg_t);
+                    msg_recv_buffer[src]->template self_check<msg_t>();
+                } else
+                {
+                    MPI_Irecv(zero_copy_data + zero_copy_recv_count, sz, get_mpi_data_type<char>(), src, Tag_Msg, MPI_COMM_WORLD, recv_req);
+                    zero_copy_recv_count += sz / sizeof(msg_t);
                 }
                
             };
@@ -1554,52 +1541,21 @@ public:
             auto send_func = [&] (partition_id_t dst, size_t diff)
             {
                 msg_send_buffer[dst]->template self_check<msg_t>();
-                // MPI_Request* req = new MPI_Request();
-                // requests.push_back(req);
-                std::cout << "diff * sizeof(msg_t) = " << diff << " " << sizeof(msg_t) << std::endl;
-                // assert(diff * sizeof(msg_t) < INT_MAX);
-                size_t send_data_size = diff * sizeof(msg_t);
-                if(send_data_size > INT_MAX){
-                    int count = 3;
-                    MPI_Request* req0 = new MPI_Request();
-                    requests.push_back(req0);
-                    MPI_Isend(&count, 1, get_mpi_data_type<int>(), dst, Tag_Msg_Count, MPI_COMM_WORLD, req0);
-                    std::cout << "Send" << count << "\n";
-
-                    MPI_Request* req = new MPI_Request();
-                    requests.push_back(req);
-                    int msg_num = 15000000;
-                    MPI_Isend(((msg_t*)msg_send_buffer[dst]->data) + send_progress[dst], (diff-2*msg_num) * sizeof(msg_t), get_mpi_data_type<char>(), dst, Tag_Msg, MPI_COMM_WORLD, req);
-                    send_progress[dst] += (diff-2*msg_num);
-                    MPI_Request* req1 = new MPI_Request();
-                    requests.push_back(req1);
-                    MPI_Isend(((msg_t*)msg_send_buffer[dst]->data) + send_progress[dst], (msg_num) * sizeof(msg_t), get_mpi_data_type<char>(), dst, Tag_Msg, MPI_COMM_WORLD, req1);
-                    send_progress[dst] += (msg_num);
-                    MPI_Request* req2 = new MPI_Request();
-                    requests.push_back(req2);
-                    MPI_Isend(((msg_t*)msg_send_buffer[dst]->data) + send_progress[dst], (msg_num) * sizeof(msg_t), get_mpi_data_type<char>(), dst, Tag_Msg, MPI_COMM_WORLD, req2);
-                    send_progress[dst] += (msg_num);
-                    
-                }else{
-                    int count = 1;
-                    MPI_Request* req0 = new MPI_Request();
-                    requests.push_back(req0);
-                    MPI_Isend(&count, 1, get_mpi_data_type<int>(), dst, Tag_Msg_Count, MPI_COMM_WORLD, req0);
-                    std::cout << "Send" << count << "\n";
-                    
-                    MPI_Request* req = new MPI_Request();
-                    requests.push_back(req);
-                    MPI_Isend(((msg_t*)msg_send_buffer[dst]->data) + send_progress[dst], diff * sizeof(msg_t), get_mpi_data_type<char>(), dst, Tag_Msg, MPI_COMM_WORLD, req);
-                    send_progress[dst] += diff;
-                }
-                // MPI_Isend(((msg_t*)msg_send_buffer[dst]->data) + send_progress[dst], diff * sizeof(msg_t), get_mpi_data_type<char>(), dst, Tag_Msg, MPI_COMM_WORLD, req);
+                MPI_Request* req = new MPI_Request();
+                requests.push_back(req);
+                // std::cout << "p "<< get_mpi_rank() << " diff * sizeof(msg_t) = " << diff << " " << sizeof(msg_t) << " " << phased_exec << std::endl;
+                // printf("[p %d] diff * sizeof(msg_t) = %u %u phased_exec %d\n", get_mpi_rank(), (unsigned)diff, (unsigned)sizeof(msg_t), phased_exec);
+                assert(diff * sizeof(msg_t) < INT_MAX);
+        
+                MPI_Isend(((msg_t*)msg_send_buffer[dst]->data) + send_progress[dst], diff * sizeof(msg_t), get_mpi_data_type<char>(), dst, Tag_Msg, MPI_COMM_WORLD, req);
+                // MPIX_Isend_x(((msg_t*)msg_send_buffer[dst]->data) + send_progress[dst], diff * sizeof(msg_t), get_mpi_data_type<char>(), dst, Tag_Msg, MPI_COMM_WORLD, req);
 #ifdef PERF_PROF
                 if (local_partition_id == 0)
                 {
                     printf("end send %u -> %u: %zu time %lf\n", local_partition_id, dst, diff, timer.duration());
                 }
 #endif
-                // send_progress[dst] += diff;
+                send_progress[dst] += diff;
             };
             for (int phase_i = 0; phase_i < phase_num; phase_i++)
             {
@@ -1609,10 +1565,10 @@ public:
                 {
                     for (partition_id_t step = 0; step < partition_num; step++)
                     {
-   
+                        
                         partition_id_t dst = (local_partition_id + step) % partition_num;
                         size_t max_progress = 0;
-
+                        
                         for (partition_id_t t_i = 0; t_i < worker_num; t_i++)
                         {
                             volatile size_t temp_val = dist_exec_ctx.progress[t_i][dst];
@@ -1621,24 +1577,35 @@ public:
                                 max_progress = temp_val;
                             }
                         }
-                        std::cout << "max_progress = " << max_progress << std::endl;
                         size_t diff = max_progress - send_progress[dst];
                         send_func(dst, diff);
                     }
                 } else
                 {
                     partition_id_t dst = (local_partition_id + phase_i) % partition_num;
-                    size_t min_progress = UINT_MAX;
+                    // [Original] diff = 本地线程发送到dst的最小进度 - 上次发送到dst的进度
+                    // size_t min_progress = UINT_MAX;
+                    // for (partition_id_t t_i = 0; t_i < worker_num; t_i++)
+                    // {
+                    //     volatile size_t temp_val = dist_exec_ctx.progress[t_i][dst];
+                    //     if (temp_val < min_progress)
+                    //     {
+                    //         min_progress = temp_val;
+                    //     }
+                    // }
+                    // size_t diff = min_progress - send_progress[dst];
+
+                    // [Now] diff = min(最大进度, 最大可发送数量)，保证发送足够多的数据
+                    size_t max_progress = 0;
                     for (partition_id_t t_i = 0; t_i < worker_num; t_i++)
                     {
                         volatile size_t temp_val = dist_exec_ctx.progress[t_i][dst];
-                        if (temp_val < min_progress)
+                        if (temp_val > max_progress)
                         {
-                            min_progress = temp_val;
+                            max_progress = temp_val;
                         }
                     }
-                    std::cout << "min_progress = " << min_progress << std::endl;
-                    size_t diff = min_progress - send_progress[dst];
+                    size_t diff = min(max_progress - send_progress[dst], INT_MAX / sizeof(msg_t));
                     send_func(dst, diff);
                 }
                 dist_exec_ctx.phase_locks[phase_i].unlock();

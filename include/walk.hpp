@@ -587,10 +587,11 @@ private:
                 local_walker_num = end - begin;
                 std::swap(local_walkers, local_walkers_bak);
             };
-        this->template distributed_execute<walker_t>(
+        this->template distributed_execute_init_walkers<walker_t>(
             msg_producer,
             msg_consumer,
-            local_walkers_bak
+            local_walkers_bak,
+            (walker_end - walker_begin) >= PHASED_EXECTION_THRESHOLD * this->partition_num
         );
         if (walker_init_state_func != nullptr)
         {
