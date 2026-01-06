@@ -1296,16 +1296,15 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
   long long local_iter = iter;
 
   // use in kernel
-  int total_sent_len, reduSize = 32;
+  int total_sent_len, reduSize = 32, total_capacity = MAX_SENTENCE * avg_length;
   int *sen, *sentence_length, *d_sen, *d_sent_len, *negSample, *d_negSample;
-  sen = (int *)malloc(MAX_SENTENCE * 100 * sizeof(int));
+  sen = (int *)malloc(total_capacity * sizeof(int));
   sentence_length = (int *)malloc((MAX_SENTENCE + 1) * sizeof(int));
-  negSample = (int *)malloc(MAX_SENTENCE * negative * sizeof(int));
+  negSample = (int *)malloc(MAX_SENTENCE * max_length * negative * sizeof(int));
 
-  checkCUDAerr(cudaMalloc((void **)&d_sen, MAX_SENTENCE * 100 * sizeof(int)));
+  checkCUDAerr(cudaMalloc((void **)&d_sen, total_capacity * sizeof(int)));
   checkCUDAerr(cudaMalloc((void **)&d_sent_len, (MAX_SENTENCE + 1) * sizeof(int)));
-  checkCUDAerr(cudaMalloc(&d_negSample, MAX_SENTENCE * negative * sizeof(int)));
-
+  checkCUDAerr(cudaMalloc(&d_negSample, MAX_SENTENCE * max_length * negative * sizeof(int)));
   std::vector<uint16_t> subsample_thresholds = BuildSubsamplingThresholds(sample, train_words);
 
   if (!subsample_thresholds.empty()) {
@@ -1313,9 +1312,7 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
   }
   FastRandomState fast_rng(InitSeedForRank(my_rank, 0x2ULL));
 
-  while (reduSize < layer1_size) {
-    reduSize *= 2;
-  }
+  while (reduSize < layer1_size) reduSize *= 2;
   clock_t now;
   start = clock();
 
@@ -1379,26 +1376,31 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
       cnt_sentence++;
       sentence_length[cnt_sentence] = total_sent_len;
       corpus_index++;
-      if (total_sent_len >= (MAX_SENTENCE - 1) * 20) break;
+      if ((total_capacity - total_sent_len) < max_length) break;
     }
 
     if (cnt_sentence == 0) break;
 
-    // Generate negative samples (match file mode behavior)
-    for (int i = 0; i < cnt_sentence * negative; i++) {
-      uint32_t randd = fast_rng.Next32();
-      int tempSample = table[randd % table_size];
-      if (tempSample == 0) {
-        negSample[i] = static_cast<int>(randd % (vocab_size - 1)) + 1;
-      } else {
-        negSample[i] = tempSample;
+    // Generate negative samples (match file mode behavior)TODO
+    int temp = 0;
+    for (int i = 0; i < cnt_sentence; i++) {
+      for(int j = 0; j < negative * max_length; j++) {
+        uint32_t randd = fast_rng.Next32();
+        int tempSample = table[randd % table_size];
+        if (tempSample == 0) {
+          // without file mode behavior TODO
+          negSample[temp] = static_cast<int>(randd % (vocab_size - 1)) + 1;
+          // negSample[temp] = tempSample;
+        } else {
+          negSample[temp] = tempSample;
+        } temp++;
       }
     }
 
     // Copy data to GPU and run training
     checkCUDAerr(cudaMemcpy(d_sen, sen, total_sent_len * sizeof(int), cudaMemcpyHostToDevice));
     checkCUDAerr(cudaMemcpy(d_sent_len, sentence_length, (cnt_sentence + 1) * sizeof(int), cudaMemcpyHostToDevice));
-    checkCUDAerr(cudaMemcpy(d_negSample, negSample, cnt_sentence * negative * sizeof(int), cudaMemcpyHostToDevice));
+    checkCUDAerr(cudaMemcpy(d_negSample, negSample, cnt_sentence * max_length * negative * sizeof(int), cudaMemcpyHostToDevice));
 
     if (cbow) {
       cbowKernel(d_sen, d_sent_len, alpha, cnt_sentence, reduSize);
