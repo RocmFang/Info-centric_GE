@@ -1393,16 +1393,16 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
       sync_cv.wait(lock,[]{return !trainBlocked;});
     }
                                                               
-    if (word_count - last_word_count > 10000) {
-      word_count_actual += word_count - last_word_count;
-      last_word_count = word_count;
-      if ((debug_mode > 1)) {
-        now = clock();
-        printf("%cAlpha: %f  Words/sec: %.2fk  ", 13, alpha,
-            word_count_actual / ((float)(now - start + 1) / (float)CLOCKS_PER_SEC * 1000));
-        fflush(stdout);
-      }
-    }
+    // if (word_count - last_word_count > 10000) {
+    //   word_count_actual += word_count - last_word_count;
+    //   last_word_count = word_count;
+    //   if ((debug_mode > 1)) {
+    //     now = clock();
+    //     printf("%cAlpha: %f  Words/sec: %.2fk  ", 13, alpha,
+    //         word_count_actual / ((float)(now - start + 1) / (float)CLOCKS_PER_SEC * 1000));
+    //     fflush(stdout);
+    //   }
+    // }
     
     total_sent_len = 0;
     sentence_length[0] = 0;
@@ -1461,8 +1461,8 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
         int tempSample = table[randd % table_size];
         if (tempSample == 0) {
           // without file mode behavior TODO
-          negSample[temp] = static_cast<int>(randd % (vocab_size - 1)) + 1;
-          // negSample[temp] = tempSample;
+          // negSample[temp] = static_cast<int>(randd % (vocab_size - 1)) + 1;
+          negSample[temp] = tempSample;
         } else {
           negSample[temp] = tempSample;
         } temp++;
