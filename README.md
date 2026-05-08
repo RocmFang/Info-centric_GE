@@ -19,7 +19,7 @@ This codebase gives the reference implementation of FeLoG
 
 The evaluated dataset Youtube and LiveJournal are prepraed in the "dataset" directory.
 
-Since the the space limited of the repository, the other datasets [Twitter](https://law.di.unimi.it/datasets.php), [Com-Orkut](https://snap.stanford.edu/), [Flickr](http://datasets.syr.edu/pages/datasets.html)，[U.K.-2007](https://law.di.unimi.it/webdata/uk-2007-05/), [OGB-papers100M](https://snap.stanford.edu/ogb/data/nodeproppred/), and [Heterophily graphs (Roman-empire & Amazon-ratings)](https://github.com/yandex-research/heterophilous-graphs) can be found in their open resource.
+Since the the space limited of the repository, the other datasets [Twitter](https://law.di.unimi.it/datasets.php), [Com-Orkut](https://snap.stanford.edu/), [Flickr](http://datasets.syr.edu/pages/datasets.html)，[U.K.-2007](https://law.di.unimi.it/webdata/uk-2007-05/), [OGB-papers100M](https://snap.stanford.edu/ogb/data/nodeproppred/), and [Heterophily datasets (Roman-empire & Amazon-ratings)](https://github.com/yandex-research/heterophilous-graphs) can be found in their open resource.
 
 # Setup
 
