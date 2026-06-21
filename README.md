@@ -1,7 +1,10 @@
 <meta name="robots" content="noindex">
 
-## FeLoG
-This codebase gives the reference implementation of FeLoG
+## This codebase gives the reference implementation of [FeLoG](https://www.vldb.org/pvldb/vol19/p2960-fang.pdf) as described in the paper:
+FeLoG: Scalable and Efficient Distributed Graph Embedding with Feedback Loop Mechanism. <br>
+Peng Fang, Arijit Khan, Ziqiang Wu, Zhenli Li, Yibo Zhou, Fang Wang, and Dan Feng. <br>
+Published to [52th International Conference on Very Large Data Bases (VLDB 2026)](https://vldb.org/2026/) <br>
+
 
 
 
@@ -78,4 +81,18 @@ mpirun -hostfile ./hosts -np 8 ./bin/felog -g ../dataset/LJ-8.data-r -p ../datas
 ```
 
 **Check the output files in "out" directory**
+
+# Citing
+If you find *FeLoG* useful for your research, please consider citing the following paper:
+```
+@article{fang2026felog,
+  title={FeLoG: Scalable and Efficient Distributed Graph Embedding with Feedback Loop Mechanism},
+  author={Fang, Peng and Khan, Arijit and Wu, Ziqiang and Li, Zhenli and Zhou, Yibo and Wang, Fang and Feng, Dan},
+  journal = {Proc. VLDB Endow.},
+  year = {2026},
+  volume = {19},
+  number = {10},
+  pages = {xxxx–xxx}
+}
+```
 
