@@ -92,7 +92,7 @@ If you find *FeLoG* useful for your research, please consider citing the followi
   year = {2026},
   volume = {19},
   number = {10},
-  pages = {xxxx–xxx}
+  pages = {2803–2816}
 }
 ```
 
