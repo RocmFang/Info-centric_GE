@@ -2,6 +2,8 @@
 #pragma once
 
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <string.h>
 #include <vector>
 #include <mutex>
@@ -148,6 +150,13 @@ public:
 
     void add_footprint(Footprint ft, int worker)
     {
+        if (worker < 0 || worker >= worker_num || thread_local_fp == nullptr)
+        {
+            fprintf(stderr,
+                    "PathCollector::add_footprint invalid state: worker=%d worker_num=%d thread_local_fp=%p\n",
+                    worker, worker_num, static_cast<void*>(thread_local_fp));
+            exit(1);
+        }
         MessageBuffer* &fp_buffer = thread_local_fp[worker];
         if (fp_buffer == nullptr)
         {

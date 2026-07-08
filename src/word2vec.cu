@@ -28,6 +28,9 @@
 #include "compress.hpp"
 #include <algorithm>
 #include <mpi.h>
+#ifdef WITH_NCCL
+#include <nccl.h>
+#endif
 
 extern int my_rank;
 
@@ -55,6 +58,16 @@ using std::endl;
     exit(0);\
   }\
 }
+
+#ifdef WITH_NCCL
+#define checkNCCLerr(err) {\
+  ncclResult_t nret = err;\
+  if (ncclSuccess != nret) {\
+    printf("%s %d : NCCL error: %s\n", __FILE__, __LINE__, ncclGetErrorString(nret));\
+    exit(1);\
+  }\
+}
+#endif
 
 int compress_size = 4 + 1;
 int min_length = MAX_SENTENCE_LENGTH + 1;
@@ -241,13 +254,54 @@ inline void RecordAddWordToVocabSample(double total, double alloc, double copy, 
 MPI_Comm MPI_EMB_COMM;
 MPI_Comm MPI_EVA_COMM;
 MPI_Comm MPI_SYNC_COMM;
+MPI_Comm MPI_NODE_COMM = MPI_COMM_NULL;
 int num_procs = 1;
 int my_rank = 0;
 
 float model_sync_period = 0.1f;
+double sync_spend_time = 0.0f;
 mutex sync_mtx;
 condition_variable sync_cv;
 bool trainBlocked = false;
+
+enum EmbeddingSyncBackend {
+  EMB_SYNC_MPI = 0,
+  EMB_SYNC_MPI_CUDA = 1,
+  EMB_SYNC_NCCL = 2
+};
+
+enum EmbeddingSyncScope {
+  EMB_SYNC_SELECTED = 0,
+  EMB_SYNC_FULL = 1
+};
+
+EmbeddingSyncBackend embedding_sync_backend = EMB_SYNC_MPI;
+EmbeddingSyncScope embedding_sync_scope = EMB_SYNC_SELECTED;
+int embedding_sync_local_rank = 0;
+int embedding_sync_local_size = 1;
+int embedding_sync_device_id = -1;
+bool embedding_sync_initialized = false;
+bool training_mpi_context_initialized = false;
+unsigned long long embedding_sync_calls = 0;
+double embedding_sync_total_time = 0.0;
+size_t embedding_sync_last_payload_bytes = 0;
+bool active_frontier_probe_enabled = false;
+bool active_frontier_probe_ignore_stall = false;
+int active_frontier_probe_max_evals = 0;
+FILE *active_frontier_probe_file = NULL;
+std::vector<std::pair<vertex_id_t, vertex_id_t> > active_frontier_probe_parts;
+unsigned long long active_frontier_probe_eval = 0;
+
+void init_active_frontier_probe(int argc, char **argv);
+void write_active_frontier_probe(int train_iter);
+void finalize_active_frontier_probe();
+
+#ifdef WITH_NCCL
+ncclComm_t embedding_nccl_comm;
+cudaStream_t embedding_nccl_stream;
+bool embedding_nccl_comm_initialized = false;
+bool embedding_nccl_stream_initialized = false;
+#endif
 
 struct vocab_word {
   long long cn;
@@ -1193,35 +1247,575 @@ void sgKernel(int *d_sen, int *d_sent_len, int *d_negSample, float alpha, int cn
 }
 volatile bool halt_sync = false;
 volatile bool pause_sync = false;
-void all_sync(){
-    // REVERTED: Back to simple averaging - all nodes train same vocabulary
-    checkCUDAerr(cudaMemcpy(syn0, d_syn0, (size_t)vocab_size * layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
-    checkCUDAerr(cudaDeviceSynchronize());
-    
-    MPI_Allreduce(MPI_IN_PLACE, syn0, (size_t)vocab_size* layer1_size , MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
-    
-    for(size_t i = 0; i < (size_t) vocab_size * layer1_size;i++){
-        syn0[i] /= num_procs;
-    }
-    
-    checkCUDAerr(cudaMemcpy(d_syn0, syn0, (size_t)vocab_size * layer1_size * sizeof(float), cudaMemcpyHostToDevice));
-    checkCUDAerr(cudaDeviceSynchronize());
+
+const char *embedding_sync_backend_name()
+{
+  if (embedding_sync_backend == EMB_SYNC_NCCL) return "nccl";
+  if (embedding_sync_backend == EMB_SYNC_MPI_CUDA) return "mpi-cuda";
+  return "mpi";
 }
-double sync_spend_time = 0.0f;
+
+const char *embedding_sync_scope_name()
+{
+  if (embedding_sync_scope == EMB_SYNC_FULL) return "full";
+  return "selected";
+}
+
+void parse_embedding_sync_options(int argc, char **argv)
+{
+  embedding_sync_backend = EMB_SYNC_MPI;
+  embedding_sync_scope = EMB_SYNC_SELECTED;
+  for (int a = 1; a < argc; a++) {
+    const char *backend = NULL;
+    const char *scope = NULL;
+    if (!strcmp(argv[a], "--sync-backend")) {
+      if (a == argc - 1) {
+        printf("Argument missing for --sync-backend\n");
+        exit(1);
+      }
+      backend = argv[a + 1];
+      a++;
+    } else if (!strncmp(argv[a], "--sync-backend=", 15)) {
+      backend = argv[a] + 15;
+      if (backend[0] == '\0') {
+        printf("Argument missing for --sync-backend\n");
+        exit(1);
+      }
+    } else if (!strcmp(argv[a], "--sync-scope")) {
+      if (a == argc - 1) {
+        printf("Argument missing for --sync-scope\n");
+        exit(1);
+      }
+      scope = argv[a + 1];
+      a++;
+    } else if (!strncmp(argv[a], "--sync-scope=", 13)) {
+      scope = argv[a] + 13;
+      if (scope[0] == '\0') {
+        printf("Argument missing for --sync-scope\n");
+        exit(1);
+      }
+    } else {
+      continue;
+    }
+
+    if (backend != NULL && !strcmp(backend, "mpi")) {
+      embedding_sync_backend = EMB_SYNC_MPI;
+    } else if (backend != NULL && !strcmp(backend, "mpi-cuda")) {
+#ifdef WITH_MPI_CUDA
+      embedding_sync_backend = EMB_SYNC_MPI_CUDA;
+#else
+      printf("[ Error ] --sync-backend mpi-cuda requires a binary built with -DWITH_MPI_CUDA=ON\n");
+      exit(1);
+#endif
+    } else if (backend != NULL && !strcmp(backend, "nccl")) {
+#ifdef WITH_NCCL
+      embedding_sync_backend = EMB_SYNC_NCCL;
+#else
+      printf("[ Error ] --sync-backend nccl requires a binary built with -DWITH_NCCL=ON\n");
+      exit(1);
+#endif
+    } else if (backend != NULL) {
+      printf("[ Error ] invalid --sync-backend '%s'. Expected 'mpi', 'mpi-cuda', or 'nccl'.\n", backend);
+      exit(1);
+    }
+
+    if (scope != NULL && !strcmp(scope, "selected")) {
+      embedding_sync_scope = EMB_SYNC_SELECTED;
+    } else if (scope != NULL && !strcmp(scope, "full")) {
+      embedding_sync_scope = EMB_SYNC_FULL;
+    } else if (scope != NULL) {
+      printf("[ Error ] invalid --sync-scope '%s'. Expected 'selected' or 'full'.\n", scope);
+      exit(1);
+    }
+  }
+}
+
+__global__ void scale_embedding_kernel(float *data, size_t count, float scale)
+{
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = blockDim.x * gridDim.x;
+  for (size_t i = idx; i < count; i += stride) {
+    data[i] *= scale;
+  }
+}
+
+__global__ void pack_selected_embedding_kernel(const float *src, float *dst,
+                                               const int *offsets,
+                                               size_t row_count,
+                                               int layer_size)
+{
+  size_t total = row_count * static_cast<size_t>(layer_size);
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = blockDim.x * gridDim.x;
+  for (size_t i = idx; i < total; i += stride) {
+    size_t row = i / static_cast<size_t>(layer_size);
+    int col = static_cast<int>(i % static_cast<size_t>(layer_size));
+    dst[i] = src[static_cast<size_t>(offsets[row]) * layer_size + col];
+  }
+}
+
+__global__ void scatter_selected_embedding_kernel(float *dst, const float *src,
+                                                  const int *offsets,
+                                                  size_t row_count,
+                                                  int layer_size)
+{
+  size_t total = row_count * static_cast<size_t>(layer_size);
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = blockDim.x * gridDim.x;
+  for (size_t i = idx; i < total; i += stride) {
+    size_t row = i / static_cast<size_t>(layer_size);
+    int col = static_cast<int>(i % static_cast<size_t>(layer_size));
+    dst[static_cast<size_t>(offsets[row]) * layer_size + col] = src[i];
+  }
+}
+
+void launch_scale_embedding(float *data, size_t count, cudaStream_t stream = 0)
+{
+  int block_size = 256;
+  int grid_size = static_cast<int>((count + block_size - 1) / block_size);
+  if (grid_size > 65535) grid_size = 65535;
+  scale_embedding_kernel<<<grid_size, block_size, 0, stream>>>(
+      data, count, 1.0f / static_cast<float>(num_procs));
+  checkCUDAerr(cudaGetLastError());
+}
+
+std::vector<vertex_id_t> build_selected_sync_vocab_ids()
+{
+  int sync_node_num = 0;
+  std::vector<vertex_id_t> sync_vocab_id_array;
+  if(my_rank == 0)
+  {
+    vector<vertex_id_t> degree_range(static_cast<size_t>(vocab_size) + 1);
+    degree_range[0] = 0;
+    vertex_id_t n = 1;
+    for(vertex_id_t vi = 1; vi < vocab_size;vi++){
+      if(vocab[vi].cn != vocab[vi-1].cn){
+        degree_range[n] = vi;
+        n++;
+      }
+    }
+    degree_range[n]  = vocab_size;
+    random_device rd;
+    mt19937 gen(rd());
+    for(vertex_id_t v = 1; v <= n; v++)
+    {
+      uniform_int_distribution<>dis(degree_range[v-1],degree_range[v]-1);
+      sync_vocab_id_array.push_back(dis(gen));
+    }
+    sync_node_num = static_cast<int>(sync_vocab_id_array.size());
+  }
+
+  MPI_Bcast(&sync_node_num, 1, get_mpi_data_type<int>(), 0, MPI_SYNC_COMM);
+  if(my_rank != 0) sync_vocab_id_array.resize(sync_node_num);
+  MPI_Bcast(sync_vocab_id_array.data(), sync_node_num,
+            get_mpi_data_type<vertex_id_t>(), 0, MPI_SYNC_COMM);
+  return sync_vocab_id_array;
+}
+
+bool selected_rows_all_gpu_resident(const std::vector<vertex_id_t> &ids,
+                                    std::vector<int> *offsets)
+{
+  offsets->resize(ids.size());
+  for (size_t i = 0; i < ids.size(); i++) {
+    int offset = syn0_id2offset[ids[i]];
+    (*offsets)[i] = offset;
+    if (offset < 0) return false;
+  }
+  return true;
+}
+
+void pack_selected_embedding_to_host(const std::vector<vertex_id_t> &ids,
+                                     float *host_buffer)
+{
+  for(vertex_id_t i = 0; i < ids.size(); i++){
+    vertex_id_t id = ids[i];
+    if(syn0_id2offset[id] != -1){
+      checkCUDAerr(cudaMemcpy(host_buffer + static_cast<size_t>(i) * layer1_size,
+                              d_syn0 + static_cast<size_t>(syn0_id2offset[id]) * layer1_size,
+                              layer1_size * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+    }
+    else{
+      memcpy(host_buffer + static_cast<size_t>(i) * layer1_size,
+             syn0 + static_cast<size_t>(id) * layer1_size,
+             layer1_size * sizeof(float));
+    }
+  }
+}
+
+void scatter_selected_embedding_from_host(const std::vector<vertex_id_t> &ids,
+                                          const float *host_buffer)
+{
+  for(vertex_id_t i = 0; i < ids.size(); i++){
+    vertex_id_t id = ids[i];
+    memcpy(syn0 + static_cast<size_t>(id) * layer1_size,
+           host_buffer + static_cast<size_t>(i) * layer1_size,
+           layer1_size * sizeof(float));
+    if(syn0_id2offset[id] != -1){
+      checkCUDAerr(cudaMemcpy(d_syn0 + static_cast<size_t>(syn0_id2offset[id]) * layer1_size,
+                              host_buffer + static_cast<size_t>(i) * layer1_size,
+                              layer1_size * sizeof(float),
+                              cudaMemcpyHostToDevice));
+    }
+  }
+}
+
+void mpi_cuda_allreduce_device_buffer(float *device_buffer, size_t count)
+{
+#ifdef WITH_MPI_CUDA
+  if (count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    printf("[ %d ] ERROR: mpi-cuda sync requires count <= INT_MAX, got %zu\n",
+           my_rank, count);
+    exit(1);
+  }
+  MPI_Allreduce(MPI_IN_PLACE, device_buffer, static_cast<int>(count),
+                MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
+#else
+  printf("[ %d ] ERROR: mpi-cuda backend is not compiled in\n", my_rank);
+  exit(1);
+#endif
+}
+
+void nccl_allreduce_device_buffer(float *device_buffer, size_t count)
+{
+#ifdef WITH_NCCL
+  if (!embedding_nccl_comm_initialized) return;
+  checkNCCLerr(ncclAllReduce(device_buffer, device_buffer, count, ncclFloat,
+                             ncclSum, embedding_nccl_comm,
+                             embedding_nccl_stream));
+#else
+  printf("[ %d ] ERROR: NCCL backend is not compiled in\n", my_rank);
+  exit(1);
+#endif
+}
+
+void init_embedding_sync()
+{
+  if (embedding_sync_initialized) return;
+
+  embedding_sync_calls = 0;
+  embedding_sync_total_time = 0.0;
+  embedding_sync_last_payload_bytes = 0;
+
+  MPI_Comm_split_type(MPI_SYNC_COMM, MPI_COMM_TYPE_SHARED, my_rank, MPI_INFO_NULL, &MPI_NODE_COMM);
+  MPI_Comm_rank(MPI_NODE_COMM, &embedding_sync_local_rank);
+  MPI_Comm_size(MPI_NODE_COMM, &embedding_sync_local_size);
+
+  int device_count = 0;
+  cudaError_t device_err = cudaGetDeviceCount(&device_count);
+  if (device_err == cudaSuccess && device_count > 0) {
+    embedding_sync_device_id = embedding_sync_local_rank % device_count;
+    checkCUDAerr(cudaSetDevice(embedding_sync_device_id));
+  } else {
+    embedding_sync_device_id = -1;
+  }
+
+  if (my_rank == 0) {
+    printf("[ Embedding Sync ] backend=%s scope=%s ranks=%d\n",
+           embedding_sync_backend_name(), embedding_sync_scope_name(), num_procs);
+  }
+  printf("[ %d ] Embedding sync local_rank=%d local_size=%d gpu=%d backend=%s scope=%s\n",
+         my_rank, embedding_sync_local_rank, embedding_sync_local_size,
+         embedding_sync_device_id, embedding_sync_backend_name(), embedding_sync_scope_name());
+
+#ifdef WITH_NCCL
+  if (embedding_sync_backend == EMB_SYNC_NCCL && num_procs > 1) {
+    if (device_count <= 0) {
+      printf("[ %d ] ERROR: NCCL backend requires at least one CUDA device\n", my_rank);
+      exit(1);
+    }
+    ncclUniqueId nccl_id;
+    if (my_rank == 0) {
+      checkNCCLerr(ncclGetUniqueId(&nccl_id));
+    }
+    MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_SYNC_COMM);
+    checkCUDAerr(cudaStreamCreate(&embedding_nccl_stream));
+    embedding_nccl_stream_initialized = true;
+    checkNCCLerr(ncclCommInitRank(&embedding_nccl_comm, num_procs, nccl_id, my_rank));
+    embedding_nccl_comm_initialized = true;
+  }
+#endif
+
+  embedding_sync_initialized = true;
+}
+
+void init_training_mpi_context(int argc, char **argv)
+{
+  if (training_mpi_context_initialized) return;
+
+  MPI_Comm_dup(MPI_COMM_WORLD, &MPI_EMB_COMM);
+  MPI_Comm_dup(MPI_COMM_WORLD, &MPI_EVA_COMM);
+  MPI_Comm_dup(MPI_COMM_WORLD, &MPI_SYNC_COMM);
+  MPI_Comm_size(MPI_EMB_COMM, &num_procs);
+  MPI_Comm_rank(MPI_EMB_COMM, &my_rank);
+  parse_embedding_sync_options(argc, argv);
+  init_embedding_sync();
+
+  training_mpi_context_initialized = true;
+}
+
+void finalize_embedding_sync()
+{
+  if (!embedding_sync_initialized) return;
+
+#ifdef WITH_NCCL
+  if (embedding_nccl_comm_initialized) {
+    checkNCCLerr(ncclCommDestroy(embedding_nccl_comm));
+    embedding_nccl_comm_initialized = false;
+  }
+  if (embedding_nccl_stream_initialized) {
+    checkCUDAerr(cudaStreamDestroy(embedding_nccl_stream));
+    embedding_nccl_stream_initialized = false;
+  }
+#endif
+
+  double avg_sync_time = embedding_sync_calls == 0
+      ? 0.0
+      : embedding_sync_total_time / static_cast<double>(embedding_sync_calls);
+  printf("[ %d ] Embedding sync summary backend=%s scope=%s calls=%llu total=%.6fs avg=%.6fs payload=%zu bytes\n",
+         my_rank, embedding_sync_backend_name(), embedding_sync_scope_name(),
+         embedding_sync_calls, embedding_sync_total_time, avg_sync_time,
+         embedding_sync_last_payload_bytes);
+
+  if (MPI_NODE_COMM != MPI_COMM_NULL) {
+    MPI_Comm_free(&MPI_NODE_COMM);
+    MPI_NODE_COMM = MPI_COMM_NULL;
+  }
+  embedding_sync_initialized = false;
+}
+
+void sync_embedding_mpi_selected()
+{
+  std::vector<vertex_id_t> ids = build_selected_sync_vocab_ids();
+  const size_t element_count = ids.size() * static_cast<size_t>(layer1_size);
+  if (element_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    printf("[ %d ] ERROR: mpi selected sync requires count <= INT_MAX, got %zu\n",
+           my_rank, element_count);
+    exit(1);
+  }
+  if (element_count == 0) {
+    embedding_sync_last_payload_bytes = 0;
+    return;
+  }
+
+  std::vector<float> host_buffer(element_count);
+  pack_selected_embedding_to_host(ids, host_buffer.data());
+  MPI_Allreduce(MPI_IN_PLACE, host_buffer.data(), static_cast<int>(element_count),
+                MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
+  for(size_t i = 0; i < element_count; i++){
+    host_buffer[i] /= num_procs;
+  }
+  scatter_selected_embedding_from_host(ids, host_buffer.data());
+  embedding_sync_last_payload_bytes = element_count * sizeof(float);
+}
+
+void sync_embedding_mpi_full()
+{
+  if (vocab_size > syn_size) {
+    printf("[ %d ] ERROR: mpi full embedding sync requires full d_syn0, but vocab_size=%lld > syn_size=%d\n",
+           my_rank, vocab_size, syn_size);
+    exit(1);
+  }
+
+  const size_t embedding_count = static_cast<size_t>(vocab_size) * static_cast<size_t>(layer1_size);
+  if (embedding_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    printf("[ %d ] ERROR: mpi full sync requires count <= INT_MAX, got %zu\n",
+           my_rank, embedding_count);
+    exit(1);
+  }
+
+  checkCUDAerr(cudaMemcpy(syn0, d_syn0, embedding_count * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+  checkCUDAerr(cudaDeviceSynchronize());
+  MPI_Allreduce(MPI_IN_PLACE, syn0, static_cast<int>(embedding_count),
+                MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
+  for(size_t i = 0; i < embedding_count; i++){
+    syn0[i] /= num_procs;
+  }
+  checkCUDAerr(cudaMemcpy(d_syn0, syn0, embedding_count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+  checkCUDAerr(cudaDeviceSynchronize());
+  embedding_sync_last_payload_bytes = embedding_count * sizeof(float);
+}
+
+void sync_embedding_device_selected()
+{
+  std::vector<vertex_id_t> ids = build_selected_sync_vocab_ids();
+  const size_t row_count = ids.size();
+  const size_t element_count = row_count * static_cast<size_t>(layer1_size);
+  if (element_count == 0) {
+    embedding_sync_last_payload_bytes = 0;
+    return;
+  }
+
+  std::vector<int> offsets;
+  bool all_gpu_resident = selected_rows_all_gpu_resident(ids, &offsets);
+
+  float *d_sync_buffer = nullptr;
+  int *d_offsets = nullptr;
+  checkCUDAerr(cudaMalloc(&d_sync_buffer, element_count * sizeof(float)));
+
+  if (all_gpu_resident) {
+    checkCUDAerr(cudaMalloc(&d_offsets, row_count * sizeof(int)));
+    checkCUDAerr(cudaMemcpy(d_offsets, offsets.data(), row_count * sizeof(int),
+                            cudaMemcpyHostToDevice));
+    int block_size = 256;
+    int grid_size = static_cast<int>((element_count + block_size - 1) / block_size);
+    if (grid_size > 65535) grid_size = 65535;
+    pack_selected_embedding_kernel<<<grid_size, block_size>>>(
+        d_syn0, d_sync_buffer, d_offsets, row_count, layer1_size);
+    checkCUDAerr(cudaGetLastError());
+    checkCUDAerr(cudaDeviceSynchronize());
+  } else {
+    std::vector<float> host_buffer(element_count);
+    pack_selected_embedding_to_host(ids, host_buffer.data());
+    checkCUDAerr(cudaMemcpy(d_sync_buffer, host_buffer.data(),
+                            element_count * sizeof(float),
+                            cudaMemcpyHostToDevice));
+  }
+
+  if (embedding_sync_backend == EMB_SYNC_MPI_CUDA) {
+    mpi_cuda_allreduce_device_buffer(d_sync_buffer, element_count);
+    launch_scale_embedding(d_sync_buffer, element_count);
+    checkCUDAerr(cudaDeviceSynchronize());
+  } else {
+    nccl_allreduce_device_buffer(d_sync_buffer, element_count);
+#ifdef WITH_NCCL
+    launch_scale_embedding(d_sync_buffer, element_count, embedding_nccl_stream);
+    checkCUDAerr(cudaStreamSynchronize(embedding_nccl_stream));
+#else
+    checkCUDAerr(cudaDeviceSynchronize());
+#endif
+  }
+
+  if (all_gpu_resident) {
+    int block_size = 256;
+    int grid_size = static_cast<int>((element_count + block_size - 1) / block_size);
+    if (grid_size > 65535) grid_size = 65535;
+    scatter_selected_embedding_kernel<<<grid_size, block_size>>>(
+        d_syn0, d_sync_buffer, d_offsets, row_count, layer1_size);
+    checkCUDAerr(cudaGetLastError());
+    checkCUDAerr(cudaDeviceSynchronize());
+  } else {
+    std::vector<float> host_buffer(element_count);
+    checkCUDAerr(cudaMemcpy(host_buffer.data(), d_sync_buffer,
+                            element_count * sizeof(float),
+                            cudaMemcpyDeviceToHost));
+    scatter_selected_embedding_from_host(ids, host_buffer.data());
+  }
+
+  if (d_offsets != nullptr) cudaFree(d_offsets);
+  cudaFree(d_sync_buffer);
+  embedding_sync_last_payload_bytes = element_count * sizeof(float);
+}
+
+void sync_embedding_mpi_cuda_selected()
+{
+#ifdef WITH_MPI_CUDA
+  sync_embedding_device_selected();
+#else
+  printf("[ %d ] ERROR: mpi-cuda backend is not compiled in\n", my_rank);
+  exit(1);
+#endif
+}
+
+void sync_embedding_nccl_selected()
+{
+#ifdef WITH_NCCL
+  if (!embedding_nccl_comm_initialized) return;
+  sync_embedding_device_selected();
+#else
+  printf("[ %d ] ERROR: NCCL backend is not compiled in\n", my_rank);
+  exit(1);
+#endif
+}
+
+void sync_embedding_nccl_full()
+{
+#ifdef WITH_NCCL
+  if (!embedding_nccl_comm_initialized) return;
+
+  if (vocab_size > syn_size) {
+    printf("[ %d ] ERROR: NCCL full embedding sync requires full d_syn0, but vocab_size=%lld > syn_size=%d\n",
+           my_rank, vocab_size, syn_size);
+    exit(1);
+  }
+
+  const size_t embedding_count = static_cast<size_t>(vocab_size) * static_cast<size_t>(layer1_size);
+  embedding_sync_last_payload_bytes = embedding_count * sizeof(float);
+  checkCUDAerr(cudaDeviceSynchronize());
+  nccl_allreduce_device_buffer(d_syn0, embedding_count);
+  launch_scale_embedding(d_syn0, embedding_count, embedding_nccl_stream);
+  checkCUDAerr(cudaStreamSynchronize(embedding_nccl_stream));
+#else
+  printf("[ %d ] ERROR: NCCL backend is not compiled in\n", my_rank);
+  exit(1);
+#endif
+}
+
+void sync_embedding_mpi_cuda_full()
+{
+#ifdef WITH_MPI_CUDA
+  if (vocab_size > syn_size) {
+    printf("[ %d ] ERROR: mpi-cuda full embedding sync requires full d_syn0, but vocab_size=%lld > syn_size=%d\n",
+           my_rank, vocab_size, syn_size);
+    exit(1);
+  }
+
+  const size_t embedding_count = static_cast<size_t>(vocab_size) * static_cast<size_t>(layer1_size);
+  if (embedding_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    printf("[ %d ] ERROR: mpi-cuda sync currently requires embedding count <= INT_MAX, got %zu\n",
+           my_rank, embedding_count);
+    exit(1);
+  }
+
+  embedding_sync_last_payload_bytes = embedding_count * sizeof(float);
+  checkCUDAerr(cudaDeviceSynchronize());
+  mpi_cuda_allreduce_device_buffer(d_syn0, embedding_count);
+  launch_scale_embedding(d_syn0, embedding_count);
+  checkCUDAerr(cudaDeviceSynchronize());
+#else
+  printf("[ %d ] ERROR: mpi-cuda backend is not compiled in\n", my_rank);
+  exit(1);
+#endif
+}
+
+void sync_embedding()
+{
+  Timer sync_timer;
+  if (embedding_sync_scope == EMB_SYNC_FULL) {
+    if (embedding_sync_backend == EMB_SYNC_NCCL) {
+      sync_embedding_nccl_full();
+    } else if (embedding_sync_backend == EMB_SYNC_MPI_CUDA) {
+      sync_embedding_mpi_cuda_full();
+    } else {
+      sync_embedding_mpi_full();
+    }
+  } else {
+    if (embedding_sync_backend == EMB_SYNC_NCCL) {
+      sync_embedding_nccl_selected();
+    } else if (embedding_sync_backend == EMB_SYNC_MPI_CUDA) {
+      sync_embedding_mpi_cuda_selected();
+    } else {
+      sync_embedding_mpi_selected();
+    }
+  }
+  double elapsed = sync_timer.duration();
+  sync_spend_time += elapsed;
+  embedding_sync_total_time += elapsed;
+  embedding_sync_calls++;
+}
 
 void sync_embedding_func()
 {
   // Skip synchronization in single-process runs
   if (num_procs == 1) return;
   
-  Timer sync_timer;
   int wait_time = 1000;
   chrono::steady_clock::time_point syncTime = chrono::steady_clock::now() + chrono::milliseconds(wait_time);
-  // int sync_times = 1;
   while(!halt_sync)
   {
     sleep(wait_time/1000);
-    //wait_until syncTime.
     unique_lock<std::mutex> lock(sync_mtx);
     sync_cv.wait_until(lock,syncTime);
 
@@ -1234,80 +1828,10 @@ void sync_embedding_func()
     //block the training thread; 
     trainBlocked = true;
 
-    sync_timer.restart();
-    // CPU or GPU -> buffer -> MPI -> buffer -> CPU or GPU
-    // No.1 pick up the sync id;
-    int sync_node_num;
-    vector<vertex_id_t> sync_vocab_id_array; // vocab id is not node id. It's the idx in the vpcab
-    if(my_rank == 0)
-    {
-      vector<vertex_id_t> degree_range(vocab_size);
-      degree_range[0] = 0;
-      vertex_id_t n = 1;
-      for(vertex_id_t vi = 1; vi < vocab_size;vi++){//TODO
-        if(vocab[vi].cn != vocab[vi-1].cn){
-          degree_range[n] = vi;
-          n++;
-        }
-      }
-      degree_range[n]  = vocab_size;
-      random_device rd;
-      mt19937 gen(rd());
-      for(vertex_id_t v = 1; v <= n; v++)
-      {
-        uniform_int_distribution<>dis(degree_range[v-1],degree_range[v]-1); 
-        sync_vocab_id_array.push_back(dis(gen));
-      }
-      sync_node_num = sync_vocab_id_array.size();
-    }
-    // broadcast sync id amount
-    MPI_Bcast(&sync_node_num,1,get_mpi_data_type<int>(),0,MPI_SYNC_COMM);
-    if(my_rank != 0) sync_vocab_id_array.resize(sync_node_num);
-    MPI_Bcast(sync_vocab_id_array.data(), sync_node_num, get_mpi_data_type<int>(), 0, MPI_SYNC_COMM);
-    // printf("[ %d ] sync_vocab_id_array size: %ld\n",my_rank,sync_vocab_id_array.size());
-
-    // embedding buffer
-    float *h_sync_emb_buffer = (float*)malloc(sync_node_num * layer1_size *sizeof(float));
-    if(h_sync_emb_buffer == NULL){
-      printf("[ %d ] ERROR. malloc h_sync_emb_buffer fail\n",my_rank);
-    }
-    // load specific embedding from CPU or GPU
-    for(vertex_id_t i = 0; i < sync_vocab_id_array.size(); i++){
-      if(syn0_id2offset[sync_vocab_id_array[i]] != -1){ // in GPU
-        checkCUDAerr(cudaMemcpy(h_sync_emb_buffer + i*layer1_size,
-                                d_syn0 + syn0_id2offset[sync_vocab_id_array[i]]*layer1_size,
-                                layer1_size * sizeof(float),
-                                cudaMemcpyDeviceToHost));
-      }
-      else{ // in CPU
-        memcpy(h_sync_emb_buffer + i*layer1_size,
-              syn0 + sync_vocab_id_array[i]*layer1_size,
-              layer1_size * sizeof(float));
-      }
-    }
-    MPI_Allreduce(MPI_IN_PLACE, h_sync_emb_buffer, sync_node_num * layer1_size, MPI_FLOAT, MPI_SUM, MPI_SYNC_COMM);
-    for(vertex_id_t i = 0; i < sync_node_num * layer1_size; i++){
-      h_sync_emb_buffer[i] /= num_procs;
-    }
-    // write back to the CPU or GPU
-    for(vertex_id_t i = 0; i < sync_vocab_id_array.size(); i++){
-      if(syn0_id2offset[sync_vocab_id_array[i]] != -1){ // in GPU
-        checkCUDAerr(cudaMemcpy(d_syn0 + syn0_id2offset[sync_vocab_id_array[i]]*layer1_size,
-                                h_sync_emb_buffer + i*layer1_size,
-                                layer1_size * sizeof(float),
-                                cudaMemcpyHostToDevice));
-      }
-      else{ // in CPU
-        memcpy(syn0 + sync_vocab_id_array[i]*layer1_size,
-              h_sync_emb_buffer + i*layer1_size,
-              layer1_size * sizeof(float));
-      }
-    }
-    sync_spend_time += sync_timer.duration(); 
+    sync_embedding();
     syncTime = chrono::steady_clock::now() + chrono::milliseconds(wait_time); // next sync time.
     trainBlocked = false; // unblock the traing thread.
     sync_cv.notify_one(); // wake trainer
-    // printf("[ %d ] Syncing Times No.%d, sync %d nodes\n", my_rank, sync_times++, sync_node_num);
   }
 }
 
@@ -1487,6 +2011,17 @@ void TrainModelThreadMemory(const corpus_t& corpus_data)
     if(write_back_flag) {cudaDeviceSynchronize();write_back(syn0, d_syn0, syn0_id2offset); syn0_num = 0; memset(syn0_id2offset, -1, vocab_size * sizeof(int));}
   }
   cudaDeviceSynchronize();
+
+  if (num_procs > 1) {
+    {
+      lock_guard<mutex> lock(sync_mtx);
+      pause_sync = true;
+    }
+    sync_cv.notify_all();
+    MPI_Barrier(MPI_EMB_COMM);
+    sync_embedding();
+    MPI_Barrier(MPI_EMB_COMM);
+  }
 
   if(vocab_size > syn_size) write_back(syn0, d_syn0, syn0_id2offset);
   else checkCUDAerr(cudaMemcpy(syn0, d_syn0, vocab_size * layer1_size * sizeof(float), cudaMemcpyDeviceToHost));
@@ -2447,7 +2982,8 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
   // Vocabulary now comes directly from in-memory degrees; legacy file-based loaders are removed.
   if (output_file[0] == 0) printf("[ Warning ] output file missing\n");
   if (output_file[0] == 0) return;
-  
+
+  init_embedding_sync();
 
   InitNet();
   
@@ -2483,10 +3019,11 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
 
   // printf("[ %d ] Batch GPU memory allocation successful\n", my_rank);
 
+  halt_sync = false;
+  pause_sync = false;
+  trainBlocked = false;
+
   thread* sync_thread = nullptr;
-  if (num_procs > 1) {
-    sync_thread = new thread(sync_embedding_func);
-  }
   vertex_id_t last_eva_num = vocab_size;
   int train_iter = 0;
   bool stop_train_flag = false;
@@ -2509,16 +3046,16 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
     // cout << "====== POP CORPUS DATA (size: " << corpus_data.size() << ") ===" << endl;
     train_iter++;
     alpha = lr_scheduler->get_lr();
-    pause_sync = false;
+    {
+      lock_guard<mutex> lock(sync_mtx);
+      pause_sync = false;
+    }
     
     MPI_Barrier(MPI_EMB_COMM);// stop sync thread until all the sync thread is ready to be halted
 
     time_collector.timer_for_train_model.restart();
     TrainModelThreadMemory(corpus_data);  // New function to train with memory data
     time_collector.train_thread_time += time_collector.timer_for_train_model.duration();
-
-    MPI_Barrier(MPI_EMB_COMM);
-    pause_sync = true;
 
     if(train_iter >= init_round) {
       pauseWalk.store(true, std::memory_order_relaxed); // pause additional walks
@@ -2583,10 +3120,19 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
       
       // printf("[ %d ] vertex_walker_stop_flag size: %lu\n",my_rank,vertex_walker_stop_flag.size());
       MPI_Allreduce(MPI_IN_PLACE, vertex_walker_stop_flag.data(),vertex_walker_stop_flag.size(), MPI_INT, MPI_MAX, MPI_EVA_COMM);
+      write_active_frontier_probe(train_iter);
       MPI_Allreduce(MPI_IN_PLACE, &eva_num, 1, get_mpi_data_type<vertex_id_t>(), MPI_SUM , MPI_EVA_COMM);
       // If convergence stalls, stop further synchronization and sampling
       float eva_num_ratio = (float)eva_num / last_eva_num;
-      if( last_eva_num != 0 && eva_num_ratio> EVALUATION_NEIGHBOUR_NUM_CONVERGE_RATIO ){
+      if( last_eva_num != 0 &&
+          eva_num_ratio> EVALUATION_NEIGHBOUR_NUM_CONVERGE_RATIO &&
+          !active_frontier_probe_ignore_stall ){
+        halt_sync = true;
+        stop_sampling_flag = true;
+        stop_train_flag = true;
+      }
+      if(active_frontier_probe_max_evals > 0 &&
+         train_iter >= init_round + active_frontier_probe_max_evals - 1) {
         halt_sync = true;
         stop_sampling_flag = true;
         stop_train_flag = true;
@@ -2610,6 +3156,9 @@ void TrainModel(SyncQueue& taskq,myEdgeContainer*csr, const TrainingConfig& conf
     // printf("[ %d ] Syncing Thread Halt\n",my_rank);
     delete sync_thread;
   }
+
+  finalize_embedding_sync();
+  finalize_active_frontier_probe();
   
   // Free batch processing GPU memory
   // printf("[ %d ] Freeing batch GPU memory\n", my_rank);
@@ -2710,6 +3259,137 @@ int ArgPos(char *str, int argc, char **argv) {
   }
   return -1;
 }
+
+const char *ArgValue(const char *str, int argc, char **argv) {
+  for (int a = 1; a < argc; a++) {
+    if (!strcmp(str, argv[a])) {
+      if (a == argc - 1) {
+        printf("Argument missing for %s\n", str);
+        exit(1);
+      }
+      return argv[a + 1];
+    }
+  }
+  return NULL;
+}
+
+void init_active_frontier_probe(int argc, char **argv) {
+  const char *probe_out = getenv("FELOG_ACTIVE_PROBE_OUT");
+  if (probe_out == NULL || probe_out[0] == '\0') return;
+  const char *ignore_stall = getenv("FELOG_ACTIVE_PROBE_IGNORE_STALL");
+  active_frontier_probe_ignore_stall =
+      ignore_stall != NULL && !strcmp(ignore_stall, "1");
+  const char *max_evals = getenv("FELOG_ACTIVE_PROBE_MAX_EVALS");
+  active_frontier_probe_max_evals =
+      max_evals == NULL || max_evals[0] == '\0' ? 0 : atoi(max_evals);
+
+  if (active_frontier_probe_enabled || my_rank != 0) return;
+
+  const char *partition_path = getenv("FELOG_ACTIVE_PROBE_PARTITION");
+  if (partition_path == NULL || partition_path[0] == '\0') {
+    partition_path = ArgValue("-p", argc, argv);
+  }
+  if (partition_path == NULL || partition_path[0] == '\0') {
+    fprintf(stderr, "[ ActiveProbe ] FELOG_ACTIVE_PROBE_OUT set but no partition path found\n");
+    return;
+  }
+
+  FILE *part_fp = fopen(partition_path, "r");
+  if (part_fp == NULL) {
+    fprintf(stderr, "[ ActiveProbe ] failed to open partition file: %s\n", partition_path);
+    return;
+  }
+
+  active_frontier_probe_parts.clear();
+  for (int p = 0; p < num_procs; p++) {
+    vertex_id_t begin = 0;
+    vertex_id_t end = 0;
+    if (fscanf(part_fp, "%u %u", &begin, &end) != 2) {
+      fprintf(stderr, "[ ActiveProbe ] failed to read partition %d from %s\n", p, partition_path);
+      active_frontier_probe_parts.clear();
+      break;
+    }
+    active_frontier_probe_parts.push_back(std::make_pair(begin, end));
+  }
+  fclose(part_fp);
+
+  if (active_frontier_probe_parts.size() != static_cast<size_t>(num_procs)) return;
+
+  active_frontier_probe_file = fopen(probe_out, "w");
+  if (active_frontier_probe_file == NULL) {
+    fprintf(stderr, "[ ActiveProbe ] failed to open output file: %s\n", probe_out);
+    active_frontier_probe_parts.clear();
+    return;
+  }
+
+  fprintf(active_frontier_probe_file,
+          "eval,train_iter,world_size,partition,begin,end,total,active,converged,active_ratio,static_ratio\n");
+  fflush(active_frontier_probe_file);
+  active_frontier_probe_eval = 0;
+  active_frontier_probe_enabled = true;
+  printf("[ ActiveProbe ] enabled output=%s partition=%s parts=%d\n",
+         probe_out, partition_path, num_procs);
+}
+
+void write_active_frontier_probe(int train_iter) {
+  if (!active_frontier_probe_enabled || my_rank != 0 || active_frontier_probe_file == NULL) return;
+
+  std::vector<vertex_id_t> active_counts(active_frontier_probe_parts.size(), 0);
+  std::vector<vertex_id_t> total_counts(active_frontier_probe_parts.size(), 0);
+  vertex_id_t min_active = 0;
+  vertex_id_t max_active = 0;
+  vertex_id_t min_total = 0;
+  vertex_id_t max_total = 0;
+
+  for (size_t p = 0; p < active_frontier_probe_parts.size(); p++) {
+    vertex_id_t begin = active_frontier_probe_parts[p].first;
+    vertex_id_t end = active_frontier_probe_parts[p].second;
+    if (end > static_cast<vertex_id_t>(vertex_walker_stop_flag.size())) {
+      end = static_cast<vertex_id_t>(vertex_walker_stop_flag.size());
+    }
+    total_counts[p] = end > begin ? end - begin : 0;
+    for (vertex_id_t v = begin; v < end; v++) {
+      if (vertex_walker_stop_flag[v] == 0) active_counts[p]++;
+    }
+    if (p == 0 || active_counts[p] < min_active) min_active = active_counts[p];
+    if (p == 0 || active_counts[p] > max_active) max_active = active_counts[p];
+    if (p == 0 || total_counts[p] < min_total) min_total = total_counts[p];
+    if (p == 0 || total_counts[p] > max_total) max_total = total_counts[p];
+  }
+
+  double active_ratio = min_active == 0 ? 0.0 : static_cast<double>(max_active) / static_cast<double>(min_active);
+  double static_ratio = min_total == 0 ? 0.0 : static_cast<double>(max_total) / static_cast<double>(min_total);
+
+  for (size_t p = 0; p < active_frontier_probe_parts.size(); p++) {
+    vertex_id_t total = total_counts[p];
+    vertex_id_t active = active_counts[p];
+    fprintf(active_frontier_probe_file,
+            "%llu,%d,%d,%zu,%u,%u,%u,%u,%u,%.6f,%.6f\n",
+            active_frontier_probe_eval,
+            train_iter,
+            num_procs,
+            p,
+            active_frontier_probe_parts[p].first,
+            active_frontier_probe_parts[p].second,
+            total,
+            active,
+            total >= active ? total - active : 0,
+            active_ratio,
+            static_ratio);
+  }
+  fflush(active_frontier_probe_file);
+  active_frontier_probe_eval++;
+}
+
+void finalize_active_frontier_probe() {
+  if (active_frontier_probe_file != NULL) {
+    fclose(active_frontier_probe_file);
+    active_frontier_probe_file = NULL;
+  }
+  active_frontier_probe_enabled = false;
+  active_frontier_probe_parts.clear();
+}
+
 int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,SyncQueue& corpus_q,int _my_rank,myEdgeContainer* csr, const TrainingConfig& config) 
 {
   Timer actual_training_timer;
@@ -2720,17 +3400,14 @@ int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,S
   int hostname_len;
 
   cout <<_my_rank << " train_corpus_cuda invoke ok\n";
-  MPI_Comm_dup(MPI_COMM_WORLD,&MPI_EMB_COMM);
-  MPI_Comm_dup(MPI_COMM_WORLD,&MPI_EVA_COMM);
-  MPI_Comm_dup(MPI_COMM_WORLD,&MPI_SYNC_COMM);
-  MPI_Comm_size(MPI_EMB_COMM, &num_procs);
-  MPI_Comm_rank(MPI_EMB_COMM, &my_rank);
   MPI_Get_processor_name(hostname, &hostname_len);
+  init_training_mpi_context(argc, argv);
 
   // printf("processor name: %s, number of processors: %d, rank: %d\n", hostname, num_procs, my_rank);
 
   vertex_walker_stop_flag.assign(degrees.size(),0);
   g_v_degree.assign(degrees.begin(), degrees.end());
+  init_active_frontier_probe(argc, argv);
 
   const size_t node_count = g_v_degree.size();
   const size_t desired_vocab_capacity = node_count + 1000ULL;
@@ -2759,10 +3436,14 @@ int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,S
     printf("\t\tUse Hierarchical Softmax; default is 0 (not used)\n");
     printf("\t-negative <int>\n");
     printf("\t\tNumber of negative examples; default is 5, common values are 3 - 10 (0 = not used)\n");
-    printf("\t-reuse-neg <int>\n");
-    printf("\t\tA sentence share a negative sample set; (0 = not used / 1 = used)\n");
+	    printf("\t-reuse-neg <int>\n");
+	    printf("\t\tA sentence share a negative sample set; (0 = not used / 1 = used)\n");
+	    printf("\t--sync-backend <mpi|mpi-cuda|nccl>\n");
+	    printf("\t\tEmbedding synchronization backend; default is mpi\n");
+	    printf("\t--sync-scope <selected|full>\n");
+	    printf("\t\tEmbedding synchronization scope; default is selected\n");
 
-    printf("\t-iter <int>\n");
+	    printf("\t-iter <int>\n");
     printf("\t\tRun more training iterations (default 5)\n");
     printf("\t-min-count <int>\n");
     printf("\t\tThis will discard words that appear less than <int> times; default is 5\n");

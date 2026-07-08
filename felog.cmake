@@ -11,6 +11,9 @@ function(add_cuda_exec EXEC_NAME)
     link_directories(/usr/local/cuda-11.6/targets/x86_64-linux/lib/)
     cuda_add_executable(${EXEC_NAME} ${EXEC_NAME}.cpp ${CMAKE_SOURCE_DIR}/src/word2vec.cu )
     target_link_libraries(${EXEC_NAME} ${MPI_LIBRARIES} )
+    if(WITH_NCCL)
+        target_link_libraries(${EXEC_NAME} ${NCCL_LIBRARY})
+    endif()
 endfunction(add_cuda_exec EXEC_NAME)
 
 

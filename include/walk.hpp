@@ -637,8 +637,7 @@ public:
 
         walker_id_t walker_num = walker_config->walker_num;
         // walker_id_t walker_num = walker_config->walker_num * init_round;
-        // walker_id_t walker_per_iter = walker_num * walk_config->rate;
-        walker_id_t walker_per_iter = walker_num;
+        walker_id_t walker_per_iter = walker_num * walk_config->rate;
         if (walker_per_iter == 0) walker_per_iter = 1;
         if (walker_per_iter > walker_num) walker_per_iter = walker_num;
         size_t walker_array_size = walker_per_iter;
@@ -674,6 +673,10 @@ public:
         
         while (remained_walker != 0)
         {
+            {
+                unique_lock<mutex> lock(mtx);
+                cv.wait(lock,[]{return !hasResource;});
+            }
 
             
             printf("\n【 %d Round %d Started】 \n",get_mpi_rank(),iter);
@@ -778,8 +781,8 @@ public:
                             std::cout << "pi = " << pi << std::endl;
                         }
                         assert(pi > 0 && pi <1);
-                        double qi =  static_cast<double>(this->vertex_freq[i]) / words_sum;
-                        if(qi == 0){std::cout << "this->vertex_freq[ " << i << " ] = " << this->vertex_freq[i] <<" degree: "<<this->vertex_out_degree[i]<< std::endl;}
+                        double qi = static_cast<double>(this->vertex_freq[i]) / words_sum;
+                        if(qi <= 0) qi = 1e-12;
                         if(qi <= 0 || qi >= 1){
                             std::cout << "qi = " << qi << std::endl;
                         }
@@ -942,7 +945,9 @@ public:
                                 walker.step++;
                                 __sync_fetch_and_add(&p_step, 1);
                                 // this->vertex_cn[current_v]++;
-                                pc->add_footprint(Footprint(walker.id, current_v, walker.step), worker_id);
+                                if (output_flag && pc != nullptr) {
+                                    pc->add_footprint(Footprint(walker.id, current_v, walker.step), worker_id);
+                                }
 
                                 if(walker.step > minLength)
                                 {
@@ -1040,7 +1045,9 @@ public:
                                 walker.step++;
                                 __sync_fetch_and_add(&p_step, 1);
                                 // this->vertex_cn[dst]++;
-                                pc->add_footprint(Footprint(walker.id, dst, walker.step), worker_id);
+                                if (output_flag && pc != nullptr) {
+                                    pc->add_footprint(Footprint(walker.id, dst, walker.step), worker_id);
+                                }
                                 double fi = static_cast<double>(walker_to_path[walker.id][dst]++);
                                 assert(fi >= 0);
                                 __sync_fetch_and_add(&intr_num, 1);
@@ -1067,7 +1074,9 @@ public:
                                     __sync_fetch_and_add(&p_step, 1);
                                     walker.step++;
                                     // this->vertex_cn[current_v]++;
-                                    pc->add_footprint(Footprint(walker.id, current_v, walker.step), worker_id);
+                                    if (output_flag && pc != nullptr) {
+                                        pc->add_footprint(Footprint(walker.id, current_v, walker.step), worker_id);
+                                    }
                                     __sync_fetch_and_add(&intr_num, 1);
 
                                     double fi = static_cast<double>(walker_to_path[walker.id][current_v]++);

@@ -863,7 +863,16 @@ public:
             fclose(fp);
         }
 
-
+        if (this->vertex_partition_end[partition_num - 1] != v_num)
+        {
+            fprintf(stderr,
+                    "[p%d] partition mismatch: last partition end=%u, vertex_num=%u, partition_num=%u, partition_path=%s\n",
+                    this->local_partition_id,
+                    this->vertex_partition_end[partition_num - 1],
+                    v_num,
+                    static_cast<unsigned>(partition_num),
+                    partition_path);
+        }
         assert(this->vertex_partition_end[partition_num - 1] == v_num);
 
         this->vertex_partition_id = alloc_vertex_array<partition_id_t>();

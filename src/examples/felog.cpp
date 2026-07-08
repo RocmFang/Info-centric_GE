@@ -10,6 +10,9 @@
 #include <cstdio>
 #include "compress.hpp"
 #include <map>
+#include <cstring>
+#include <cstdlib>
+#include <iostream>
 
 
 // template struct EdgeContainer<real_t>;
@@ -24,15 +27,82 @@ struct TrainingConfig {
 };
 
 int train_corpus_cuda(int argc, char **argv,const vector<vertex_id_t>& degrees,SyncQueue& corpus_q,int _my_rank,myEdgeContainer *csr, const TrainingConfig& config);
+void init_training_mpi_context(int argc, char **argv);
 
 struct Empty
 {
 };
 
+void validate_sync_options(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++) {
+        const char *backend = nullptr;
+        const char *scope = nullptr;
+        if (std::strcmp(argv[i], "--sync-backend") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Argument missing for --sync-backend" << std::endl;
+                std::exit(1);
+            }
+            backend = argv[i + 1];
+            i++;
+        } else if (std::strncmp(argv[i], "--sync-backend=", 15) == 0) {
+            backend = argv[i] + 15;
+            if (backend[0] == '\0') {
+                std::cerr << "Argument missing for --sync-backend" << std::endl;
+                std::exit(1);
+            }
+        } else if (std::strcmp(argv[i], "--sync-scope") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Argument missing for --sync-scope" << std::endl;
+                std::exit(1);
+            }
+            scope = argv[i + 1];
+            i++;
+        } else if (std::strncmp(argv[i], "--sync-scope=", 13) == 0) {
+            scope = argv[i] + 13;
+            if (scope[0] == '\0') {
+                std::cerr << "Argument missing for --sync-scope" << std::endl;
+                std::exit(1);
+            }
+        } else {
+            continue;
+        }
+        if (backend != nullptr &&
+            std::strcmp(backend, "mpi") != 0 &&
+            std::strcmp(backend, "mpi-cuda") != 0 &&
+            std::strcmp(backend, "nccl") != 0) {
+            std::cerr << "invalid --sync-backend '" << backend
+                      << "'. Expected 'mpi', 'mpi-cuda', or 'nccl'." << std::endl;
+            std::exit(1);
+        }
+#ifndef WITH_MPI_CUDA
+        if (backend != nullptr && std::strcmp(backend, "mpi-cuda") == 0) {
+            std::cerr << "--sync-backend mpi-cuda requires a binary built with -DWITH_MPI_CUDA=ON" << std::endl;
+            std::exit(1);
+        }
+#endif
+#ifndef WITH_NCCL
+        if (backend != nullptr && std::strcmp(backend, "nccl") == 0) {
+            std::cerr << "--sync-backend nccl requires a binary built with -DWITH_NCCL=ON" << std::endl;
+            std::exit(1);
+        }
+#endif
+        if (scope != nullptr &&
+            std::strcmp(scope, "selected") != 0 &&
+            std::strcmp(scope, "full") != 0) {
+            std::cerr << "invalid --sync-scope '" << scope
+                      << "'. Expected 'selected' or 'full'." << std::endl;
+            std::exit(1);
+        }
+    }
+}
+
 // ./bin/simple_walk -g ./karate.data -v 34 -w 34 -o ./out/walks.txt > perf_dist.txt
 int main(int argc, char **argv)
 {
     umask(0);
+    validate_sync_options(argc, argv);
+
     Timer timer;
     double load_graph_time = 0.0;
     double data_conversion_time = 0.0;
@@ -43,7 +113,6 @@ int main(int argc, char **argv)
     // double training_time = 0.0;
     MPI_Instance mpi_instance(&argc, &argv);
     int my_rank = get_mpi_rank();
-
 
     RandomWalkOptionHelper opt;
     opt.parse(argc, argv);
@@ -85,6 +154,11 @@ int main(int argc, char **argv)
     }
     // cout <<my_rank <<" myec access " << myec-> adj_lists[110].begin->neighbour<<endl; 
     // cout << my_rank <<" graph.csr access " << graph.csr-> adj_lists[110].begin->neighbour<<endl; 
+
+    // Initialize training-side communicators before random walk starts.  These
+    // calls are collective on MPI_COMM_WORLD, so doing them here keeps all ranks
+    // in the same MPI phase.
+    init_training_mpi_context(argc, argv);
 
     // =============== Start Training Thread ===============
     Timer training_start_timer;

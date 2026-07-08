@@ -153,15 +153,21 @@ private:
     args::ValueFlag<walker_id_t> walker_num_flag;
     args::ValueFlag<std::string> output_path_flag;
     args::ValueFlag<double> rate_flag;
+    args::ValueFlag<std::string> sync_backend_flag;
+    args::ValueFlag<std::string> sync_scope_flag;
 public:
     walker_id_t walker_num;
     std::string output_path;
+    std::string sync_backend;
+    std::string sync_scope;
     double rate;
     bool set_rate;
     RandomWalkOptionHelper() :
         walker_num_flag(parser, "walker", "walker number", {'w'}),
         output_path_flag(parser, "output", "[optional] the output path. Omit this option for pure random walk performance testing without output.", {'o'}),
-        rate_flag(parser, "rate", "Set this option will break random walk into multiple iterations to save memory. Each iteration has rate% walkers.", {'r'})
+        rate_flag(parser, "rate", "Set this option will break random walk into multiple iterations to save memory. Each iteration has rate% walkers.", {'r'}),
+        sync_backend_flag(parser, "sync_backend", "Embedding synchronization backend: mpi, mpi-cuda, or nccl", {"sync-backend"}),
+        sync_scope_flag(parser, "sync_scope", "Embedding synchronization scope: selected or full", {"sync-scope"})
     {}
 
     virtual void parse(int argc, char** argv)
@@ -183,6 +189,51 @@ public:
         } else
         {
             set_rate = false;
+        }
+
+        if (sync_backend_flag)
+        {
+            sync_backend = args::get(sync_backend_flag);
+            if (sync_backend.compare("mpi") != 0 &&
+                sync_backend.compare("mpi-cuda") != 0 &&
+                sync_backend.compare("nccl") != 0)
+            {
+                std::cerr << "invalid --sync-backend '" << sync_backend
+                          << "'. Expected 'mpi', 'mpi-cuda', or 'nccl'." << std::endl;
+                exit(1);
+            }
+#ifndef WITH_MPI_CUDA
+            if (sync_backend.compare("mpi-cuda") == 0)
+            {
+                std::cerr << "--sync-backend mpi-cuda requires a binary built with -DWITH_MPI_CUDA=ON" << std::endl;
+                exit(1);
+            }
+#endif
+#ifndef WITH_NCCL
+            if (sync_backend.compare("nccl") == 0)
+            {
+                std::cerr << "--sync-backend nccl requires a binary built with -DWITH_NCCL=ON" << std::endl;
+                exit(1);
+            }
+#endif
+        } else
+        {
+            sync_backend = "mpi";
+        }
+
+        if (sync_scope_flag)
+        {
+            sync_scope = args::get(sync_scope_flag);
+            if (sync_scope.compare("selected") != 0 &&
+                sync_scope.compare("full") != 0)
+            {
+                std::cerr << "invalid --sync-scope '" << sync_scope
+                          << "'. Expected 'selected' or 'full'." << std::endl;
+                exit(1);
+            }
+        } else
+        {
+            sync_scope = "selected";
         }
     }
 };
